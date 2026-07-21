@@ -1,0 +1,15 @@
+.venv/
+.venv-appimage/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+*.AppImage
+*.AppImage.zsync
+.ruff_cache/
+.coverage
+htmlcov/

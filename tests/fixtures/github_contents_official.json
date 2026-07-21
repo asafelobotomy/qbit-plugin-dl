@@ -1,0 +1,68 @@
+[
+  {
+    "name": "__init__.py",
+    "path": "nova3/engines/__init__.py",
+    "sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+    "size": 0,
+    "url": "https://api.github.com/repos/qbittorrent/search-plugins/contents/nova3/engines/__init__.py?ref=master",
+    "html_url": "https://github.com/qbittorrent/search-plugins/blob/master/nova3/engines/__init__.py",
+    "git_url": "https://api.github.com/repos/qbittorrent/search-plugins/git/blobs/e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+    "download_url": "https://raw.githubusercontent.com/qbittorrent/search-plugins/master/nova3/engines/__init__.py",
+    "type": "file"
+  },
+  {
+    "name": "template.py",
+    "path": "nova3/engines/template.py",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "size": 100,
+    "url": "https://api.github.com/repos/qbittorrent/search-plugins/contents/nova3/engines/template.py?ref=master",
+    "html_url": "https://github.com/qbittorrent/search-plugins/blob/master/nova3/engines/template.py",
+    "git_url": "https://api.github.com/repos/qbittorrent/search-plugins/git/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "download_url": "https://raw.githubusercontent.com/qbittorrent/search-plugins/master/nova3/engines/template.py",
+    "type": "file"
+  },
+  {
+    "name": "eztv.py",
+    "path": "nova3/engines/eztv.py",
+    "sha": "6d437aa2d0b548c441dcd8428347c9001e3e361e",
+    "size": 4677,
+    "url": "https://api.github.com/repos/qbittorrent/search-plugins/contents/nova3/engines/eztv.py?ref=master",
+    "html_url": "https://github.com/qbittorrent/search-plugins/blob/master/nova3/engines/eztv.py",
+    "git_url": "https://api.github.com/repos/qbittorrent/search-plugins/git/blobs/6d437aa2d0b548c441dcd8428347c9001e3e361e",
+    "download_url": "https://raw.githubusercontent.com/qbittorrent/search-plugins/master/nova3/engines/eztv.py",
+    "type": "file"
+  },
+  {
+    "name": "jackett.py",
+    "path": "nova3/engines/jackett.py",
+    "sha": "18c8a431ea70e160701127276669cb5be446a1e5",
+    "size": 11265,
+    "url": "https://api.github.com/repos/qbittorrent/search-plugins/contents/nova3/engines/jackett.py?ref=master",
+    "html_url": "https://github.com/qbittorrent/search-plugins/blob/master/nova3/engines/jackett.py",
+    "git_url": "https://api.github.com/repos/qbittorrent/search-plugins/git/blobs/18c8a431ea70e160701127276669cb5be446a1e5",
+    "download_url": "https://raw.githubusercontent.com/qbittorrent/search-plugins/master/nova3/engines/jackett.py",
+    "type": "file"
+  },
+  {
+    "name": "limetorrents.py",
+    "path": "nova3/engines/limetorrents.py",
+    "sha": "bcf6f6ac0d8d476d74404c7e3248a558defc8f1d",
+    "size": 5646,
+    "url": "https://api.github.com/repos/qbittorrent/search-plugins/contents/nova3/engines/limetorrents.py?ref=master",
+    "html_url": "https://github.com/qbittorrent/search-plugins/blob/master/nova3/engines/limetorrents.py",
+    "git_url": "https://api.github.com/repos/qbittorrent/search-plugins/git/blobs/bcf6f6ac0d8d476d74404c7e3248a558defc8f1d",
+    "download_url": "https://raw.githubusercontent.com/qbittorrent/search-plugins/master/nova3/engines/limetorrents.py",
+    "type": "file"
+  },
+  {
+    "name": "piratebay.py",
+    "path": "nova3/engines/piratebay.py",
+    "sha": "6e43d0401f5333ff89f04ea3315775e7e51d27e4",
+    "size": 5987,
+    "url": "https://api.github.com/repos/qbittorrent/search-plugins/contents/nova3/engines/piratebay.py?ref=master",
+    "html_url": "https://github.com/qbittorrent/search-plugins/blob/master/nova3/engines/piratebay.py",
+    "git_url": "https://api.github.com/repos/qbittorrent/search-plugins/git/blobs/6e43d0401f5333ff89f04ea3315775e7e51d27e4",
+    "download_url": "https://raw.githubusercontent.com/qbittorrent/search-plugins/master/nova3/engines/piratebay.py",
+    "type": "file"
+  }
+]

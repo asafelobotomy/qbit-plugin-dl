@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>qbit-plugin-dl</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>qBittorrent Plugin Downloader</name>
+  <summary>Selective installer for qBittorrent search plugins from allowlisted catalogs</summary>
+  <description>
+    <p>
+      Fetches allowlisted search-plugin catalogs (unofficial MediaWiki list,
+      official qBittorrent nova3 engines, and LightDestory), merges duplicates
+      by install filename, and lets you select plugins to install into the
+      local nova3 engines directory.
+    </p>
+    <p>
+      Bundled with Python {{ python-fullversion }}, PySide6, and httpx.
+    </p>
+  </description>
+  <launchable type="desktop-id">qbit-plugin-dl.desktop</launchable>
+  <url type="help">https://github.com/qbittorrent/search-plugins/wiki/Unofficial-search-plugins</url>
+  <provides>
+    <binary>qbit-plugin-dl</binary>
+  </provides>
+  <releases>
+    <release version="0.0.1" date="2026-07-22"/>
+  </releases>
+</component>

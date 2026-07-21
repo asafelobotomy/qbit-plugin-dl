@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qbit-plugin-dl"
+version = "0.0.1"
+description = "Selective installer for unofficial qBittorrent search plugins"
+# Canonical release version. __init__.__version__ falls back to this string
+# when the package is not installed; importlib.metadata wins after install.
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "qbitPluginDL contributors" }]
+dependencies = [
+    "httpx>=0.27",
+    "PySide6>=6.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+qbit-plugin-dl = "qbit_plugin_dl.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+qbit_plugin_dl = ["resources/*.png"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
