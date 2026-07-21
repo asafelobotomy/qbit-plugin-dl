@@ -122,6 +122,12 @@ Builds a wheel, syncs icons, generates `appimage/requirements.txt`, and runs [`p
 pytest
 ```
 
+## Releases
+
+GitHub Actions publishes a release when `pyproject.toml` / `__init__.py` version is bumped on `main` (and AppStream lists the same version). The workflow builds the AppImage, attaches `SHA256SUMS.txt`, and writes release notes from commits since the previous tag (plus GitHub’s generated changelog).
+
+You can also run **Actions → Release → Run workflow** with **force** to publish the current version if its tag does not exist yet.
+
 ## Catalog sources
 
 v1 merges three allowlisted providers (best-effort; one failure does not block the others):
@@ -142,7 +148,7 @@ Caches (6-hour TTL) under `${XDG_CACHE_HOME:-~/.cache}/qbit-plugin-dl/`:
 - `sources/{id}.json` for each GitHub listing
 - `installed.json` — download URL + content hash recorded on successful installs (used for update checks)
 
-Project homepage / repository URLs for software centers will be added when a public remote exists. Until then, AppStream lists the upstream wiki as help only.
+Homepage: [github.com/asafelobotomy/qbit-plugin-dl](https://github.com/asafelobotomy/qbit-plugin-dl). AppStream still lists the upstream wiki as help.
 
 ## License
 

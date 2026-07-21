@@ -1,0 +1,228 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Create a release for the current version even without a version bump"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build AppImage and publish GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect version bump
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_INPUT: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          version="$(python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+          data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          print(data["project"]["version"])
+          PY
+          )"
+          init_version="$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path("src/qbit_plugin_dl/__init__.py").read_text(encoding="utf-8")
+          match = re.search(r'^__version__\s*=\s*"([^"]+)"', text, re.M)
+          if not match:
+              raise SystemExit("Could not parse __version__")
+          print(match.group(1))
+          PY
+          )"
+
+          if [[ "$version" != "$init_version" ]]; then
+            echo "::error::Version mismatch: pyproject.toml=$version __init__.py=$init_version"
+            exit 1
+          fi
+
+          if ! grep -q "version=\"${version}\"" appimage/qbit-plugin-dl.appdata.xml; then
+            echo "::error::AppStream release entry missing version ${version}"
+            exit 1
+          fi
+
+          tag="v${version}"
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+          } >> "$GITHUB_OUTPUT"
+
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "Tag ${tag} already exists — skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          force=false
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$FORCE_INPUT" == "true" ]]; then
+            force=true
+          fi
+
+          bumped=false
+          if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            if prev="$(git show HEAD^:pyproject.toml 2>/dev/null | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])')"; then
+              if [[ "$prev" != "$version" ]]; then
+                bumped=true
+                echo "Version bumped: ${prev} → ${version}"
+              fi
+            fi
+          else
+            bumped=true
+            echo "Root commit — treating ${version} as initial release candidate."
+          fi
+
+          if [[ "$force" == "true" || "$bumped" == "true" ]]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "Will release ${tag}"
+          else
+            echo "No version bump in this push — skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.version.outputs.should_release == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        if: steps.version.outputs.should_release == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          if apt-cache show libfuse2t64 >/dev/null 2>&1; then
+            sudo apt-get install -y desktop-file-utils libfuse2t64 libgl1 libxkbcommon0 libegl1 libdbus-1-3
+          else
+            sudo apt-get install -y desktop-file-utils libfuse2 libgl1 libxkbcommon0 libegl1 libdbus-1-3
+          fi
+
+      - name: Install package and run tests
+        if: steps.version.outputs.should_release == 'true'
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pytest -q
+
+      - name: Build AppImage
+        if: steps.version.outputs.should_release == 'true'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          PYTHON_VERSION: "3.12"
+        run: |
+          set -euo pipefail
+          chmod +x scripts/build-appimage.sh scripts/sync-icons.sh
+          ./scripts/build-appimage.sh
+          ls -lh qbit-plugin-dl*.AppImage
+
+      - name: Prepare release assets and notes
+        if: steps.version.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          assets=(qbit-plugin-dl*.AppImage)
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "::error::No AppImage artifact found"
+            exit 1
+          fi
+
+          checksums="SHA256SUMS.txt"
+          : > "$checksums"
+          for asset in "${assets[@]}"; do
+            sha256sum "$asset" >> "$checksums"
+          done
+          cat "$checksums"
+
+          prev_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+
+          {
+            echo "## qbit-plugin-dl ${VERSION}"
+            echo
+            echo "Selective installer for qBittorrent search plugins (multi-source catalogs, update checks, AppImage)."
+            echo
+            echo "### Assets"
+            echo
+            for asset in "${assets[@]}"; do
+              size="$(du -h "$asset" | cut -f1)"
+              echo "- \`${asset}\` (${size})"
+            done
+            echo
+            echo "Verify downloads:"
+            echo
+            echo '```'
+            cat "$checksums"
+            echo '```'
+            echo
+            if [[ -n "$prev_tag" && "$prev_tag" != "$TAG" ]]; then
+              echo "### Changes since ${prev_tag}"
+              echo
+              echo "**Full changelog:** https://github.com/${GITHUB_REPOSITORY}/compare/${prev_tag}...${TAG}"
+            else
+              echo "### Initial release"
+              echo
+              echo "This is the first tagged release of qbit-plugin-dl."
+            fi
+            echo
+            echo "---"
+            echo
+
+            gen_args=( -f "tag_name=${TAG}" -f "target_commitish=${GITHUB_SHA}" )
+            if [[ -n "$prev_tag" && "$prev_tag" != "$TAG" ]]; then
+              gen_args+=( -f "previous_tag_name=${prev_tag}" )
+            fi
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              "${gen_args[@]}" \
+              --jq .body
+          } > RELEASE_NOTES.md
+
+          echo "----- release notes preview -----"
+          cat RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(qbit-plugin-dl*.AppImage SHA256SUMS.txt)
+
+          gh release create "$TAG" \
+            --title "qbit-plugin-dl ${VERSION}" \
+            --notes-file RELEASE_NOTES.md \
+            --target "${GITHUB_SHA}" \
+            "${files[@]}"

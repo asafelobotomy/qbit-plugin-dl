@@ -14,7 +14,7 @@ fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 
-pip install -q --upgrade pip build wheel "python-appimage>=1.4"
+pip install -q --upgrade pip build wheel "python-appimage>=1.4" Pillow
 pip install -q -e .
 
 chmod +x "${ROOT}/scripts/sync-icons.sh"
