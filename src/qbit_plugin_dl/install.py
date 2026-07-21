@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from qbit_plugin_dl.audit import AuditReport, audit_plugin_bytes
+from qbit_plugin_dl.audit_clamav import ClamAvSession
 from qbit_plugin_dl.catalog import Plugin
 from qbit_plugin_dl.provenance import content_sha, record_install_provenance
 
@@ -147,6 +149,7 @@ class InstallResult:
     ok: bool
     path: Path | None
     error: str | None = None
+    audit: AuditReport | None = None
 
 
 ProgressCallback = Callable[[int, int, Plugin, InstallResult | None], None]
@@ -157,6 +160,7 @@ async def _download_one(
     plugin: Plugin,
     engines_dir: Path,
     semaphore: asyncio.Semaphore,
+    clamav_session: ClamAvSession | None,
 ) -> InstallResult:
     async with semaphore:
         try:
@@ -181,6 +185,20 @@ async def _download_one(
                     path=None,
                     error="Empty response",
                 )
+            report = await asyncio.to_thread(
+                audit_plugin_bytes,
+                content,
+                filename=plugin.filename,
+                clamav_session=clamav_session,
+            )
+            if report.blocked:
+                return InstallResult(
+                    plugin=plugin,
+                    ok=False,
+                    path=None,
+                    error=report.summary_error(),
+                    audit=report,
+                )
             dest_tmp = Path(str(dest) + ".tmp")
             dest_tmp.write_bytes(content)
             os.replace(dest_tmp, dest)
@@ -192,7 +210,12 @@ async def _download_one(
                 )
             except OSError:
                 pass
-            return InstallResult(plugin=plugin, ok=True, path=dest)
+            return InstallResult(
+                plugin=plugin,
+                ok=True,
+                path=dest,
+                audit=report,
+            )
         except Exception as exc:  # noqa: BLE001 - report any download failure
             return InstallResult(
                 plugin=plugin,
@@ -209,6 +232,7 @@ async def install_plugins_async(
     concurrency: int = 6,
     on_progress: ProgressCallback | None = None,
     client: httpx.AsyncClient | None = None,
+    clamav_session: ClamAvSession | None = None,
 ) -> list[InstallResult]:
     """Download selected plugins into engines_dir concurrently."""
     engines_dir.mkdir(parents=True, exist_ok=True)
@@ -226,7 +250,15 @@ async def install_plugins_async(
 
     try:
         tasks = [
-            asyncio.create_task(_download_one(client, plugin, engines_dir, semaphore))
+            asyncio.create_task(
+                _download_one(
+                    client,
+                    plugin,
+                    engines_dir,
+                    semaphore,
+                    clamav_session,
+                )
+            )
             for plugin in plugins
         ]
         for task in asyncio.as_completed(tasks):
@@ -254,6 +286,7 @@ def install_plugins(
     *,
     concurrency: int = 6,
     on_progress: ProgressCallback | None = None,
+    clamav_session: ClamAvSession | None = None,
 ) -> list[InstallResult]:
     """Synchronous wrapper around install_plugins_async."""
     return asyncio.run(
@@ -262,5 +295,6 @@ def install_plugins(
             engines_dir,
             concurrency=concurrency,
             on_progress=on_progress,
+            clamav_session=clamav_session,
         )
     )

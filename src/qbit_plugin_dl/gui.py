@@ -31,6 +31,11 @@ from PySide6.QtWidgets import (
 )
 
 from qbit_plugin_dl import __version__
+from qbit_plugin_dl.audit import SEVERITY_WARN
+from qbit_plugin_dl.audit_clamav import (
+    ClamAvSession,
+    format_clamav_backend_label,
+)
 from qbit_plugin_dl.catalog import (
     Plugin,
     Visibility,
@@ -65,6 +70,8 @@ DISCLAIMER = (
     "Unofficial qBittorrent search plugins are community-provided Python scripts "
     "and are not inherently safe. Use them at your own risk. Prefer auditing a "
     "plugin before installing it.\n\n"
+    "This app runs a static safety check before writing engines, and may use "
+    "ClamAV when available. That reduces risk but is not a guarantee of safety.\n\n"
     "Plugins marked with warning symbols (✖ / ❗ / ❌) are strongly discouraged "
     "by the upstream wiki because they can slow down or break other plugins."
 )
@@ -87,6 +94,102 @@ SOURCE_LABELS = {
     "official": "Official",
     "lightdestory": "LightDestory",
 }
+
+
+def format_install_summary(
+    results: list[InstallResult],
+    engines_dir: Path,
+) -> tuple[str, str, str]:
+    """
+    Build install-complete dialog title, body, and icon kind.
+
+    Icon kind is one of: ``information``, ``warning``, ``critical``.
+    """
+    total = len(results)
+    installed = [r for r in results if r.ok]
+    failed = [r for r in results if not r.ok]
+
+    infections: list[InstallResult] = []
+    safety_blocked: list[InstallResult] = []
+    other_failed: list[InstallResult] = []
+    for result in failed:
+        report = result.audit
+        if report is not None and report.clamav_status == "infected":
+            infections.append(result)
+        elif report is not None and report.blocked:
+            safety_blocked.append(result)
+        else:
+            other_failed.append(result)
+
+    warnings: list[str] = []
+    clam_backend = "none"
+    clam_status = "skipped"
+    for result in results:
+        report = result.audit
+        if report is None:
+            continue
+        clam_backend = report.clamav_backend
+        clam_status = report.clamav_status
+        for finding in report.findings:
+            if finding.severity == SEVERITY_WARN:
+                warnings.append(
+                    f"{result.plugin.name}: {finding.code}: {finding.message}"
+                )
+
+    lines = [
+        f"Installed: {len(installed)} of {total}",
+        f"Failed: {len(failed)}",
+        f"Infections blocked: {len(infections)}",
+    ]
+    if safety_blocked:
+        lines.append(f"Safety check blocked: {len(safety_blocked)}")
+    lines.extend(
+        [
+            "",
+            f"Destination:\n{engines_dir}",
+            "",
+            format_clamav_backend_label(clam_backend, clam_status),
+            "",
+            "Restart qBittorrent (or refresh Search plugins) to load new engines.",
+        ]
+    )
+
+    def _detail_block(title: str, items: list[InstallResult]) -> None:
+        if not items:
+            return
+        lines.append("")
+        lines.append(f"{title}:")
+        for result in items:
+            err = result.error or "unknown error"
+            lines.append(f"• {result.plugin.name}: {err}")
+
+    _detail_block("Infections blocked (not installed)", infections)
+    _detail_block("Blocked by safety check", safety_blocked)
+    _detail_block("Other failures", other_failed)
+
+    if warnings:
+        shown = warnings[:12]
+        extra = len(warnings) - len(shown)
+        lines.append("")
+        lines.append("Safety warnings (installed anyway):")
+        lines.extend(f"• {w}" for w in shown)
+        if extra > 0:
+            lines.append(f"• …(+{extra} more)")
+
+    if infections:
+        title = "Install complete — infections blocked"
+        icon = "critical"
+    elif failed and not installed:
+        title = "Install failed"
+        icon = "critical"
+    elif failed:
+        title = "Install complete — with failures"
+        icon = "warning"
+    else:
+        title = "Install complete"
+        icon = "information"
+
+    return title, "\n".join(lines), icon
 
 
 def plugin_included_in_select_all(plugin: Plugin) -> bool:
@@ -113,6 +216,31 @@ def set_safety_accepted(accepted: bool = True) -> None:
     settings = _settings()
     settings.setValue("safety/accepted", accepted)
     settings.sync()
+
+
+def clamav_enabled() -> bool:
+    return bool(_settings().value("safety/clamav_enabled", True, type=bool))
+
+
+def clamav_allow_clamscan_fallback() -> bool | None:
+    """Return remembered clamscan consent, or None if unset."""
+    settings = _settings()
+    if not settings.contains("safety/allow_clamscan_fallback"):
+        return None
+    return bool(settings.value("safety/allow_clamscan_fallback", False, type=bool))
+
+
+def set_clamav_allow_clamscan_fallback(allowed: bool) -> None:
+    settings = _settings()
+    settings.setValue("safety/allow_clamscan_fallback", allowed)
+    settings.sync()
+
+
+def build_clamav_session() -> ClamAvSession:
+    return ClamAvSession(
+        enabled=clamav_enabled(),
+        allow_clamscan_fallback=clamav_allow_clamscan_fallback(),
+    )
 
 
 class CatalogWorker(QThread):
@@ -163,10 +291,16 @@ class InstallWorker(QThread):
     finished_ok = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, plugins: list[Plugin], engines_dir: Path) -> None:
+    def __init__(
+        self,
+        plugins: list[Plugin],
+        engines_dir: Path,
+        clamav_session: ClamAvSession | None = None,
+    ) -> None:
         super().__init__()
         self.plugins = plugins
         self.engines_dir = engines_dir
+        self.clamav_session = clamav_session
 
     def run(self) -> None:
         try:
@@ -186,6 +320,7 @@ class InstallWorker(QThread):
                 self.plugins,
                 self.engines_dir,
                 on_progress=on_progress,
+                clamav_session=self.clamav_session,
             )
             self.finished_ok.emit(results)
         except Exception as exc:  # noqa: BLE001
@@ -389,6 +524,11 @@ class MainWindow(QMainWindow):
                 "Selective installer for qBittorrent search plugins from multiple "
                 "allowlisted catalogs (unofficial wiki, official nova3 engines, "
                 "and LightDestory).<br><br>"
+                "Before writing engines, the app runs a static safety check. "
+                "When ClamAV is available it prefers a running <code>clamd</code> "
+                "(via <code>clamdscan --fdpass</code>); one-shot "
+                "<code>clamscan</code> needs your consent. This is a review aid, "
+                "not a guarantee that a plugin is safe.<br><br>"
                 "Plugins are community Python scripts — use them at your own risk."
             ),
         )
@@ -759,8 +899,58 @@ class MainWindow(QMainWindow):
             return
         self._start_install(plugins)
 
+    def _prompt_clamscan_consent(self, session: ClamAvSession) -> bool:
+        """
+        Ask whether to use slow clamscan when clamd is unavailable.
+
+        Returns False if the user cancels the whole install.
+        """
+        if not session.needs_clamscan_consent():
+            return True
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("ClamAV virus scan")
+        box.setText(
+            "ClamAV daemon (clamd) is not running.\n\n"
+            "One-shot clamscan reloads the virus database and can be slow. "
+            "Use clamscan for this install, or skip the virus scan "
+            "(static safety checks still run)?"
+        )
+        use_btn = box.addButton(
+            "Use clamscan",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        skip_btn = box.addButton(
+            "Skip virus scan",
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+        remember = QCheckBox("Remember this choice")
+        box.setCheckBox(remember)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is cancel_btn or clicked is None:
+            return False
+        if clicked is use_btn:
+            session.grant_clamscan_fallback()
+            if remember.isChecked():
+                set_clamav_allow_clamscan_fallback(True)
+            return True
+        if clicked is skip_btn:
+            session.deny_clamscan_fallback()
+            if remember.isChecked():
+                set_clamav_allow_clamscan_fallback(False)
+            return True
+        return False
+
     def _start_install(self, plugins: list[Plugin]) -> None:
         if self._install_worker and self._install_worker.isRunning():
+            return
+
+        session = build_clamav_session()
+        if not self._prompt_clamscan_consent(session):
             return
 
         self._engines_dir = resolve_install_dir(preferred=self._engines_dir)
@@ -770,7 +960,7 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.status_label.setText(f"Installing {len(plugins)} plugin(s)…")
 
-        worker = InstallWorker(plugins, self._engines_dir)
+        worker = InstallWorker(plugins, self._engines_dir, clamav_session=session)
         self._install_worker = worker
         worker.progress.connect(self._on_install_progress)
         worker.finished_ok.connect(self._on_install_finished)
@@ -790,16 +980,14 @@ class MainWindow(QMainWindow):
         self._refresh_installed()
         self._rebuild_tree()
         self.status_label.setText(f"Installed {ok}, failed {fail}")
-        details = "\n".join(
-            f"{r.plugin.name}: {r.error}" for r in results if not r.ok
-        )
-        msg = (
-            f"Installed {ok} of {len(results)} plugin(s) to:\n{self._engines_dir}\n\n"
-            "Restart qBittorrent (or refresh Search plugins) to load new engines."
-        )
-        if details:
-            msg += f"\n\nFailures:\n{details}"
-        QMessageBox.information(self, "Install complete", msg)
+
+        title, msg, icon_kind = format_install_summary(results, self._engines_dir)
+        if icon_kind == "critical":
+            QMessageBox.critical(self, title, msg)
+        elif icon_kind == "warning":
+            QMessageBox.warning(self, title, msg)
+        else:
+            QMessageBox.information(self, title, msg)
         self._start_update_check()
 
     def _on_install_failed(self, message: str) -> None:

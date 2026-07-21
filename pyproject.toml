@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qbit-plugin-dl"
-version = "0.0.1"
+version = "0.0.2"
 description = "Selective installer for unofficial qBittorrent search plugins"
 # Canonical release version. __init__.__version__ falls back to this string
 # when the package is not installed; importlib.metadata wins after install.
@@ -31,4 +31,4 @@ qbit_plugin_dl = ["resources/*.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]

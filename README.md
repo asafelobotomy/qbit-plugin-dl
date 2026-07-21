@@ -23,7 +23,7 @@ Fetches allowlisted catalogs (unofficial MediaWiki list, official `nova3/engines
 |---|---|
 | **Multi-source catalogs** | Unofficial wiki + official nova3 + LightDestory, each with a 6-hour cache |
 | **Category filters** | anime, books, games, movies, music, pictures, software, tv — plus Adult & Uncategorized |
-| **Safer defaults** | Discouraged wiki entries stay unchecked; optional “Hide discouraged” |
+| **Safer defaults** | Discouraged wiki entries stay unchecked; static safety check before install; optional ClamAV |
 | **Path detection** | Flatpak and native Linux engine dirs are auto-detected |
 | **One-file AppImage** | Ship a portable Qt GUI without installing Python deps |
 
@@ -39,7 +39,11 @@ Fetches allowlisted catalogs (unofficial MediaWiki list, official `nova3/engines
 
 ## Safety
 
-Unofficial plugins are community Python scripts. **Use them at your own risk.** Prefer auditing a script before installing.
+Unofficial plugins are community Python scripts. **Use them at your own risk.** Prefer reviewing a script before installing.
+
+Before writing an engine, this app runs a **static safety check** (format/encoding, AST import and call policy, nova3 structure heuristics). It never `import`s or `exec`s plugin code. When **ClamAV** is installed on the host, the app prefers a running `clamd` via `clamdscan --fdpass` (warm signature DB). If only one-shot `clamscan` is available, you are asked before each install (choice can be remembered). AppImage/Flatpak sandboxes may not see the host daemon — then only the static check runs.
+
+This is a review aid, **not** a claim that plugins are malware-free or verified secure.
 
 Plugins marked ✖ / ❗ / ❌ on the wiki are discouraged and can break other engines. This app never auto-selects them, and “Hide discouraged” leaves them out of the list by default.
 
@@ -48,11 +52,11 @@ On first launch you must **Accept** the safety notice (persisted via Qt settings
 ## Threat model
 
 - Catalog entries come from allowlisted HTTPS sources only (MediaWiki list + GitHub Contents API for known repos). Download URLs use `raw.githubusercontent.com` or the wiki’s listed HTTPS links.
-- This app downloads selected `.py` files over **HTTPS only**, validates basenames, and writes them under the chosen `nova3/engines` directory. It does **not** execute plugins.
+- This app downloads selected `.py` files over **HTTPS only**, validates basenames, runs the static safety check (and optional ClamAV), and writes them under the chosen `nova3/engines` directory. It does **not** execute plugins.
 - **qBittorrent** loads and runs installed engines later.
 - Category resolution parses `supported_categories` with `ast.literal_eval` only (never `exec` / `import` of plugin modules).
 - SHA hashes in the category cache identify source content for cache freshness — they are not a trust or integrity guarantee against malicious plugins.
-- Disclaimer + discouraged filters reduce risk but do not eliminate it.
+- Static review + optional ClamAV + disclaimer + discouraged filters reduce risk but do not eliminate it. The app never starts `clamd` or elevates privileges for scanning.
 
 ## Quick start
 
