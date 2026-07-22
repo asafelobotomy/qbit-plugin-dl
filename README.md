@@ -41,9 +41,9 @@ Fetches allowlisted catalogs (unofficial MediaWiki list, official `nova3/engines
 
 Unofficial plugins are community Python scripts. **Use them at your own risk.** Prefer reviewing a script before installing.
 
-Before writing an engine, this app runs a **static safety check** (format/encoding, AST import and call policy, nova3 structure heuristics). It never `import`s or `exec`s plugin code. When **ClamAV** is installed on the host, the app prefers a running `clamd` via `clamdscan --fdpass` (warm signature DB; scans are serialized). If only one-shot `clamscan` is available, you are asked before each install (choice can be remembered) — `clamscan` reloads the DB and is heavy on RAM, so prefer `clamd` for bulk installs. AppImage/Flatpak sandboxes may not see the host daemon — then only the static check runs.
+Before writing an engine, this app runs a **static safety check** (format/encoding, AST import and call policy, nova3 structure heuristics). It never `import`s or `exec`s plugin code. In-process **threads** (`threading`, `concurrent.futures.ThreadPoolExecutor`, `multiprocessing.dummy`) are allowed — official Jackett and many engines use them for parallel HTTP. **OS process spawning** (`multiprocessing.Process` / `Pool`, `ProcessPoolExecutor`) and other dangerous APIs stay blocked. Optional **Safe fixes during install** (off by default) may try same-filename catalog alternates and allowlisted AST rewrites (Py2→Py3, ProcessPool→ThreadPool). AST rewrites require a **clean** ClamAV result unless **Allow AST without ClamAV** is enabled (off by default). Infected content is never fixed. After any rewrite ClamAV is run again when available. Fixed installs show a 🔧 marker in the Name column. When **ClamAV** is installed on the host, the app prefers a running `clamd` via `clamdscan --fdpass` (warm signature DB; scans are serialized). If only one-shot `clamscan` is available, you are asked before each install (choice can be remembered) — `clamscan` reloads the DB and is heavy on RAM, so prefer `clamd` for bulk installs. AppImage/Flatpak sandboxes may not see the host daemon — then only the static check runs.
 
-This is a review aid, **not** a claim that plugins are malware-free or verified secure.
+This is a review aid, **not** a claim that plugins are malware-free or verified secure. It is not a sandbox.
 
 Plugins marked ✖ / ❗ / ❌ on the wiki are discouraged and can break other engines. This app never auto-selects them, and “Hide discouraged” leaves them out of the list by default.
 
@@ -52,7 +52,11 @@ On first launch you must **Accept** the safety notice (persisted via Qt settings
 ## Threat model
 
 - Catalog entries come from allowlisted HTTPS sources only (MediaWiki list + GitHub Contents API for known repos). Download URLs use `raw.githubusercontent.com` or the wiki’s listed HTTPS links.
-- This app downloads selected `.py` files over **HTTPS only**, validates basenames, runs the static safety check (and optional ClamAV), and writes them under the chosen `nova3/engines` directory. It does **not** execute plugins.
+- Downloads are **streamed** with a hard size abort, redirect cap, and **HTTPS-only** final URLs. Hosts `raw.githubusercontent.com` and `gist.githubusercontent.com` are auto-trusted; other HTTPS hosts need a one-time or “Always trust” confirmation (stored in Qt settings). Loopback / private / link-local / cloud-metadata addresses are rejected (DNS rebinding is not fully eliminated).
+- This app validates basenames, runs the static safety check (and optional ClamAV), and writes engines under the chosen `nova3/engines` directory with restrictive temp modes and atomic sidecar writes. It does **not** execute plugins.
+- The static check allows in-process threads (needed for Jackett and many engines) and blocks process spawning plus other high-risk APIs (`exec`, `subprocess`, `ctypes`, …). It is not a runtime sandbox.
+- Optional safe fixes (off by default): AST rewrites need ClamAV **clean** unless **Allow AST without ClamAV** is on; alternates may still run when ClamAV did not scan. Infected content is never “fixed” into place.
+- Provenance stores a full SHA-256 of installed bytes (plus a short `sha` for older caches). Update checks prefer the full hash when present.
 - **qBittorrent** loads and runs installed engines later.
 - Category resolution parses `supported_categories` with `ast.literal_eval` only (never `exec` / `import` of plugin modules).
 - SHA hashes in the category cache identify source content for cache freshness — they are not a trust or integrity guarantee against malicious plugins.
@@ -87,7 +91,7 @@ qbit-plugin-dl --version
 3. Filter by name, public/private, **category**, and optionally hide discouraged plugins.
 4. Check the plugins you want. When a **with categories** twin or another **author fork** installs to the same `.py` filename, the preferred engine is the main row (newest non-discouraged fork, then version / categories / qBittorrent 5 hint). Expand the row to pick an alternate instead — only one of the group can be selected.
 5. Confirm the install path (labeled Flatpak / Native / Legacy when recognized).
-6. Click **Install selected**, or **Update all** to reinstall every outdated engine from its catalog URL, then restart qBittorrent or refresh Search plugins.
+6. Click **Install selected**, or **Update all** to reinstall every outdated engine from its catalog URL. Optionally enable **Safe fixes during install** (off by default) to auto-try alternates / AST rewrites after ClamAV; enable **Allow AST without ClamAV** only if you want rewrites when ClamAV did not clean-scan. Use **Uninstall selected** for a full clean of checked installed engines (script, stem-named config like `jackett.json`, bytecode, and install provenance). Then restart qBittorrent or refresh Search plugins.
 
 ## Categories
 
