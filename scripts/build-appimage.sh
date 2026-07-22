@@ -37,7 +37,18 @@ EOF
 echo "Building AppImage with Python ${PYTHON_VERSION}…"
 # appimagetool often needs extract-and-run when FUSE is unavailable.
 export APPIMAGE_EXTRACT_AND_RUN="${APPIMAGE_EXTRACT_AND_RUN:-1}"
-python -m python_appimage build app -p "${PYTHON_VERSION}" "${ROOT}/appimage"
+
+# python-appimage names the output from desktop Name= and joins appimagetool
+# args with spaces under shell=True — spaces in Name break the build.
+# Stage a copy with a safe Name= so the artifact is qbit-plugin-dl-*.AppImage
+# while keeping the pretty Name in the committed desktop file.
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/qbit-plugin-dl-appimage.XXXXXX")"
+cleanup_stage() { rm -rf "${STAGE}"; }
+trap cleanup_stage EXIT
+cp -a "${ROOT}/appimage/." "${STAGE}/"
+sed -i 's/^Name=.*/Name=qbit-plugin-dl/' "${STAGE}/qbit-plugin-dl.desktop"
+
+python -m python_appimage build app -p "${PYTHON_VERSION}" "${STAGE}"
 
 # Restore portable requirements (without machine-local wheel path).
 cat > appimage/requirements.txt <<'EOF'
