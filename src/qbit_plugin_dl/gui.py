@@ -116,7 +116,6 @@ def plugin_column_sort_key(
     *,
     checked: bool = False,
     installed: bool = False,
-    has_update: bool = False,
 ) -> tuple:
     """Return a comparable sort key for a plugin column."""
     if column == COL_CHECK:
