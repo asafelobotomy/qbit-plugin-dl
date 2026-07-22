@@ -10,6 +10,7 @@ build/
 .mypy_cache/
 *.AppImage
 *.AppImage.zsync
+squashfs-root/
 .ruff_cache/
 .coverage
 htmlcov/
