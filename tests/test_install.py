@@ -5,7 +5,6 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import httpx
 import pytest
 
 from qbit_plugin_dl.audit_clamav import ClamAvSession
@@ -20,10 +19,18 @@ from qbit_plugin_dl.install import (
     require_https_url,
     resolve_install_dir,
     resolve_plugin_dest,
+    uninstall_plugin,
+    uninstall_plugins,
     validate_plugin_filename,
 )
-from qbit_plugin_dl.provenance import content_sha, load_installed_provenance
+from qbit_plugin_dl.provenance import (
+    content_sha,
+    content_sha256,
+    load_installed_provenance,
+    record_install_provenance,
+)
 from tests.fixtures.engine_stubs import CLEAN_ENGINE_BYTES, engine_source
+from tests.http_fakes import TRUSTED_TEST_HOSTS, AsyncSingleClient
 
 
 def _plugin(**kwargs) -> Plugin:
@@ -40,28 +47,6 @@ def _plugin(**kwargs) -> Plugin:
         warning=False,
     )
     return replace(base, **kwargs) if kwargs else base
-
-
-class _FakeResponse:
-    def __init__(self, content: bytes, url: str) -> None:
-        self.content = content
-        self.url = httpx.URL(url)
-
-    def raise_for_status(self) -> None:
-        return None
-
-
-class _FakeClient:
-    def __init__(self, content: bytes, url: str) -> None:
-        self._content = content
-        self._url = url
-
-    async def get(self, url: str) -> _FakeResponse:
-        return _FakeResponse(self._content, self._url)
-
-    async def aclose(self) -> None:
-        return None
-
 
 def test_candidate_order(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
@@ -152,7 +137,12 @@ def test_install_rejects_oversize(tmp_path: Path):
         install_plugins_async(
             [plugin],
             engines,
-            client=_FakeClient(b"x" * (MAX_PLUGIN_BYTES + 1), plugin.download_url),  # type: ignore[arg-type]
+            client=AsyncSingleClient(  # type: ignore[arg-type]
+                b"x" * (MAX_PLUGIN_BYTES + 1),
+                plugin.download_url,
+                chunk_size=64 * 1024,
+            ),
+            trusted_hosts=TRUSTED_TEST_HOSTS,
         )
     )
     assert not results[0].ok
@@ -167,7 +157,10 @@ def test_install_writes_under_engines(tmp_path: Path, monkeypatch):
         install_plugins_async(
             [plugin],
             engines,
-            client=_FakeClient(CLEAN_ENGINE_BYTES, plugin.download_url),  # type: ignore[arg-type]
+            client=AsyncSingleClient(  # type: ignore[arg-type]
+                CLEAN_ENGINE_BYTES, plugin.download_url
+            ),
+            trusted_hosts=TRUSTED_TEST_HOSTS,
         )
     )
     assert results[0].ok
@@ -182,6 +175,7 @@ def test_install_writes_under_engines(tmp_path: Path, monkeypatch):
     provenance = load_installed_provenance()
     assert provenance["demo.py"]["download_url"] == plugin.download_url
     assert provenance["demo.py"]["sha"] == content_sha(CLEAN_ENGINE_BYTES)
+    assert provenance["demo.py"]["sha256"] == content_sha256(CLEAN_ENGINE_BYTES)
 
 
 def test_install_rejects_https_redirect_to_http(tmp_path: Path):
@@ -191,7 +185,10 @@ def test_install_rejects_https_redirect_to_http(tmp_path: Path):
         install_plugins_async(
             [plugin],
             engines,
-            client=_FakeClient(CLEAN_ENGINE_BYTES, "http://example.com/demo.py"),  # type: ignore[arg-type]
+            client=AsyncSingleClient(  # type: ignore[arg-type]
+                CLEAN_ENGINE_BYTES, "http://example.com/demo.py"
+            ),
+            trusted_hosts=TRUSTED_TEST_HOSTS,
         )
     )
     assert not results[0].ok
@@ -207,7 +204,10 @@ def test_install_does_not_write_on_safety_fail(tmp_path: Path, monkeypatch):
         install_plugins_async(
             [plugin],
             engines,
-            client=_FakeClient(malicious, plugin.download_url),  # type: ignore[arg-type]
+            client=AsyncSingleClient(  # type: ignore[arg-type]
+                malicious, plugin.download_url
+            ),
+            trusted_hosts=TRUSTED_TEST_HOSTS,
         )
     )
     assert not results[0].ok
@@ -240,11 +240,99 @@ def test_install_blocks_on_clam_hit(tmp_path: Path, monkeypatch):
         install_plugins_async(
             [plugin],
             engines,
-            client=_FakeClient(CLEAN_ENGINE_BYTES, plugin.download_url),  # type: ignore[arg-type]
+            client=AsyncSingleClient(  # type: ignore[arg-type]
+                CLEAN_ENGINE_BYTES, plugin.download_url
+            ),
             clamav_session=session,
+            trusted_hosts=TRUSTED_TEST_HOSTS,
         )
     )
     assert not results[0].ok
     assert results[0].audit is not None
     assert results[0].audit.clamav_status == "infected"
     assert not (engines / "demo.py").exists()
+
+def test_uninstall_removes_engine_companions_and_provenance(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    nova3 = tmp_path / "nova3"
+    engines = nova3 / "engines"
+    engines.mkdir(parents=True)
+    (engines / "jackett.py").write_text("# engine\n", encoding="utf-8")
+    (engines / "jackett.py.tmp").write_text("tmp", encoding="utf-8")
+    (engines / "jackett.json").write_text('{"api_key": "x"}', encoding="utf-8")
+    pycache = engines / "__pycache__"
+    pycache.mkdir()
+    (pycache / "jackett.cpython-312.pyc").write_bytes(b"\0")
+    nova_cache = nova3 / "__pycache__"
+    nova_cache.mkdir()
+    (nova_cache / "jackett.cpython-312.pyc").write_bytes(b"\0")
+    # Unrelated engine must survive.
+    (engines / "other.py").write_text("# keep\n", encoding="utf-8")
+    (engines / "other.json").write_text("{}", encoding="utf-8")
+
+    record_install_provenance(
+        "jackett.py",
+        download_url="https://example.com/jackett.py",
+        sha="deadbeef",
+    )
+    record_install_provenance(
+        "other.py",
+        download_url="https://example.com/other.py",
+        sha="cafebabe",
+    )
+
+    plugin = _plugin(
+        name="Jackett",
+        download_url="https://example.com/jackett.py",
+    )
+    assert plugin.filename == "jackett.py"
+
+    results = uninstall_plugins([plugin], engines)
+    assert len(results) == 1
+    assert results[0].ok
+    assert not (engines / "jackett.py").exists()
+    assert not (engines / "jackett.py.tmp").exists()
+    assert not (engines / "jackett.json").exists()
+    assert list(pycache.glob("jackett*")) == []
+    assert list(nova_cache.glob("jackett*")) == []
+    assert (engines / "other.py").exists()
+    assert (engines / "other.json").exists()
+
+    provenance = load_installed_provenance()
+    assert "jackett.py" not in provenance
+    assert "other.py" in provenance
+
+
+def test_uninstall_idempotent_when_missing(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    engines = tmp_path / "engines"
+    engines.mkdir()
+    plugin = _plugin()
+    result = uninstall_plugin(plugin.filename, engines, plugin=plugin)
+    assert result.ok
+    assert result.removed == ()
+
+
+def test_uninstall_dedupes_shared_filename(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    engines = tmp_path / "engines"
+    engines.mkdir()
+    (engines / "demo.py").write_text("x", encoding="utf-8")
+    a = _plugin(name="A", author="one")
+    b = _plugin(name="B", author="two")
+    results = uninstall_plugins([a, b], engines)
+    assert len(results) == 1
+    assert results[0].ok
+    assert not (engines / "demo.py").exists()
+
+
+def test_uninstall_rejects_path_trick(tmp_path: Path):
+    engines = tmp_path / "engines"
+    engines.mkdir()
+    result = uninstall_plugin("../etc/passwd.py", engines)
+    assert not result.ok
+    assert "basename" in (result.error or "").lower() or "Invalid" in (
+        result.error or ""
+    )

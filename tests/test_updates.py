@@ -8,8 +8,10 @@ from pathlib import Path
 from qbit_plugin_dl.catalog import Plugin, Visibility
 from qbit_plugin_dl.provenance import (
     content_sha,
+    content_sha256,
     load_installed_provenance,
     record_install_provenance,
+    remove_install_provenance,
 )
 from qbit_plugin_dl.updates import (
     find_outdated_filenames,
@@ -52,6 +54,27 @@ def test_record_and_load_provenance(tmp_path: Path, monkeypatch):
     assert data["demo.py"]["download_url"] == "https://example.com/demo.py"
     assert data["demo.py"]["sha"] == "abcd"
     assert "installed_at" in data["demo.py"]
+
+
+def test_remove_install_provenance(tmp_path: Path):
+    path = tmp_path / "installed.json"
+    record_install_provenance(
+        "demo.py",
+        download_url="https://example.com/demo.py",
+        sha="abcd",
+        path=path,
+    )
+    record_install_provenance(
+        "other.py",
+        download_url="https://example.com/other.py",
+        sha="ef01",
+        path=path,
+    )
+    assert remove_install_provenance("demo.py", path=path) is True
+    data = load_installed_provenance(path)
+    assert "demo.py" not in data
+    assert "other.py" in data
+    assert remove_install_provenance("demo.py", path=path) is False
 
 
 def test_resolve_prefers_provenance_url():
@@ -167,3 +190,128 @@ def test_plugins_for_updates_uses_provenance():
     )
     assert len(plugins) == 1
     assert plugins[0].download_url == alt.download_url
+
+
+def test_rewritten_stable_not_outdated(tmp_path: Path):
+    engines = tmp_path / "engines"
+    engines.mkdir()
+    written = b"# rewritten body\n"
+    source = b"# original body\n"
+    (engines / "demo.py").write_bytes(written)
+    plugin = _plugin()
+    provenance = {
+        "demo.py": {
+            "download_url": plugin.download_url,
+            "sha": content_sha(written),
+            "rewritten": True,
+            "source_sha": content_sha(source),
+        }
+    }
+    outdated = find_outdated_filenames(
+        engines,
+        [plugin],
+        provenance=provenance,
+        remote_shas={plugin.download_url: content_sha(source)},
+    )
+    assert outdated == set()
+
+
+def test_rewritten_outdated_when_upstream_changes(tmp_path: Path):
+    engines = tmp_path / "engines"
+    engines.mkdir()
+    written = b"# rewritten body\n"
+    source = b"# original body\n"
+    upstream = b"# new upstream\n"
+    (engines / "demo.py").write_bytes(written)
+    plugin = _plugin()
+    provenance = {
+        "demo.py": {
+            "download_url": plugin.download_url,
+            "sha": content_sha(written),
+            "rewritten": True,
+            "source_sha": content_sha(source),
+        }
+    }
+    outdated = find_outdated_filenames(
+        engines,
+        [plugin],
+        provenance=provenance,
+        remote_shas={plugin.download_url: content_sha(upstream)},
+    )
+    assert outdated == {"demo.py"}
+
+
+def test_rewritten_outdated_when_local_drifts(tmp_path: Path):
+    """Local edits alone must not count as a catalog source update."""
+    engines = tmp_path / "engines"
+    engines.mkdir()
+    written = b"# rewritten body\n"
+    drifted = b"# manually edited\n"
+    source = b"# original body\n"
+    (engines / "demo.py").write_bytes(drifted)
+    plugin = _plugin()
+    provenance = {
+        "demo.py": {
+            "download_url": plugin.download_url,
+            "sha": content_sha(written),
+            "rewritten": True,
+            "source_sha": content_sha(source),
+        }
+    }
+    outdated = find_outdated_filenames(
+        engines,
+        [plugin],
+        provenance=provenance,
+        remote_shas={plugin.download_url: content_sha(source)},
+    )
+    assert outdated == set()
+
+
+def test_full_sha_not_confused_with_truncated_cache(tmp_path: Path):
+    """Regression: sha256 provenance must not compare against truncated cache sha."""
+    engines = tmp_path / "engines"
+    engines.mkdir()
+    body = b"# engine\n"
+    (engines / "demo.py").write_bytes(body)
+    plugin = _plugin()
+    full = content_sha256(body)
+    trunc = content_sha(body)
+    provenance = {
+        "demo.py": {
+            "download_url": plugin.download_url,
+            "sha": trunc,
+            "sha256": full,
+        }
+    }
+    # Categories cache only has truncated sha (pre-sha256 enrich).
+    categories_cache = {
+        plugin.download_url: {"sha": trunc, "fetched_at": 1.0},
+    }
+    outdated = find_outdated_filenames(
+        engines,
+        [plugin],
+        provenance=provenance,
+        categories_cache=categories_cache,
+        remote_shas={},  # force cache path; empty map means "try cache then skip fetch"
+    )
+    # With empty remote_shas dict, code treats remote_shas as provided and won't fetch.
+    # Cache has no sha256 → no remote → not outdated (avoid false positive).
+    assert outdated == set()
+
+    # Same-width remote match → not outdated.
+    outdated_ok = find_outdated_filenames(
+        engines,
+        [plugin],
+        provenance=provenance,
+        remote_shas={plugin.download_url: full},
+    )
+    assert outdated_ok == set()
+
+    # Real upstream change → outdated.
+    outdated_real = find_outdated_filenames(
+        engines,
+        [plugin],
+        provenance=provenance,
+        remote_shas={plugin.download_url: content_sha256(b"# newer\n")},
+    )
+    assert outdated_real == {"demo.py"}
