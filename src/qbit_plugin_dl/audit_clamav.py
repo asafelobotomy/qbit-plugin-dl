@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +42,9 @@ class ClamAvSession:
     _probed: bool = field(default=False, init=False, repr=False)
     _backend: BackendName = field(default="none", init=False, repr=False)
     _slow_fallback_noted: bool = field(default=False, init=False, repr=False)
+    # clamscan reloads the full signature DB (~hundreds of MB–1GB+). Never run
+    # more than one scan at a time across the install worker's to_thread pool.
+    _scan_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     @property
     def backend(self) -> BackendName:
@@ -68,9 +72,12 @@ class ClamAvSession:
         self._backend = "none"
 
     def _ping_clamd(self, clamdscan: str) -> bool:
+        # ClamAV 1.0+ requires an attempt count: `clamdscan --ping [A[:I]]`.
+        # A bare `--ping` fails to parse and made us falsely treat a live
+        # clamd as down, falling back to memory-heavy one-shot clamscan.
         try:
             completed = self.run(
-                [clamdscan, "--ping"],
+                [clamdscan, "--ping", "2"],
                 capture_output=True,
                 text=True,
                 timeout=PROBE_TIMEOUT_S,
@@ -144,6 +151,15 @@ class ClamAvSession:
                 "none",
             )
 
+        with self._scan_lock:
+            return self._scan_bytes_locked(content, filename=filename)
+
+    def _scan_bytes_locked(
+        self,
+        content: bytes,
+        *,
+        filename: str,
+    ) -> tuple[list[AuditFinding], str, str]:
         findings: list[AuditFinding] = []
         if self._backend == "clamscan" and not self._slow_fallback_noted:
             self._slow_fallback_noted = True

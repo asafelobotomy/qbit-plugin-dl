@@ -32,10 +32,76 @@ def test_prefers_clamdscan_fdpass():
     assert backend == "clamdscan"
     assert status == "clean"
     assert findings == [] or all(f.severity != "fail" for f in findings)
+    ping_calls = [c for c in calls if "--ping" in c]
+    assert ping_calls
+    assert ping_calls[0][ping_calls[0].index("--ping") + 1] == "2"
     scan_calls = [c for c in calls if "--ping" not in c]
     assert scan_calls
     assert "--fdpass" in scan_calls[0]
     assert "--infected" in scan_calls[0]
+
+
+def test_bare_ping_failure_does_not_select_clamdscan():
+    """ClamAV 1.5 rejects bare --ping; we must pass an attempt count."""
+
+    def which(name: str) -> str | None:
+        if name in {"clamdscan", "clamscan"}:
+            return f"/usr/bin/{name}"
+        return None
+
+    def run(argv, **kwargs):  # noqa: ANN001
+        if "--ping" in argv:
+            # Simulate old buggy call shape if somehow used without count.
+            if argv[-1] == "--ping":
+                return _completed(1, stderr="option `--ping' requires an argument")
+            return _completed(0)
+        return _completed(0)
+
+    session = ClamAvSession(
+        enabled=True,
+        allow_clamscan_fallback=False,
+        which=which,
+        run=run,
+    )
+    assert session.backend == "clamdscan"
+
+
+def test_scans_are_serialized():
+    import threading
+    import time
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def which(name: str) -> str | None:
+        return "/usr/bin/clamscan" if name == "clamscan" else None
+
+    def run(argv, **kwargs):  # noqa: ANN001
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        return _completed(0)
+
+    session = ClamAvSession(
+        enabled=True,
+        allow_clamscan_fallback=True,
+        which=which,
+        run=run,
+    )
+    threads = [
+        threading.Thread(target=lambda: session.scan_bytes(CLEAN_ENGINE_BYTES))
+        for _ in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert max_active == 1
 
 
 def test_exit_codes_mapping():

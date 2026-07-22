@@ -546,13 +546,15 @@ class MainWindow(QMainWindow):
         self.tree.setColumnWidth(8, 220)
         header = self.tree.header()
         header.setStretchLastSection(True)
-        header.setSectionsClickable(True)
         header.setSortIndicatorShown(True)
         # Manual sort on click so catalog order is kept until the user sorts.
+        # IMPORTANT: setSortingEnabled(False) forces sectionsClickable=False, so
+        # re-enable clickable *after* that call or header clicks do nothing.
         self._sort_column: int | None = None
         self._sort_order = Qt.SortOrder.AscendingOrder
-        header.sectionClicked.connect(self._on_header_section_clicked)
         self.tree.setSortingEnabled(False)
+        header.setSectionsClickable(True)
+        header.sectionClicked.connect(self._on_header_section_clicked)
         self.tree.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.tree, stretch=1)
 
@@ -1013,10 +1015,11 @@ class MainWindow(QMainWindow):
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle("ClamAV virus scan")
         box.setText(
-            "ClamAV daemon (clamd) is not running.\n\n"
-            "One-shot clamscan reloads the virus database and can be slow. "
-            "Use clamscan for this install, or skip the virus scan "
-            "(static safety checks still run)?"
+            "ClamAV daemon (clamd) is not running or not reachable.\n\n"
+            "One-shot clamscan reloads the virus database into memory for every "
+            "file and can use a large amount of RAM — avoid it for bulk installs. "
+            "Prefer starting clamd, or skip the virus scan "
+            "(static safety checks still run)."
         )
         use_btn = box.addButton(
             "Use clamscan",

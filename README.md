@@ -41,7 +41,7 @@ Fetches allowlisted catalogs (unofficial MediaWiki list, official `nova3/engines
 
 Unofficial plugins are community Python scripts. **Use them at your own risk.** Prefer reviewing a script before installing.
 
-Before writing an engine, this app runs a **static safety check** (format/encoding, AST import and call policy, nova3 structure heuristics). It never `import`s or `exec`s plugin code. When **ClamAV** is installed on the host, the app prefers a running `clamd` via `clamdscan --fdpass` (warm signature DB). If only one-shot `clamscan` is available, you are asked before each install (choice can be remembered). AppImage/Flatpak sandboxes may not see the host daemon — then only the static check runs.
+Before writing an engine, this app runs a **static safety check** (format/encoding, AST import and call policy, nova3 structure heuristics). It never `import`s or `exec`s plugin code. When **ClamAV** is installed on the host, the app prefers a running `clamd` via `clamdscan --fdpass` (warm signature DB; scans are serialized). If only one-shot `clamscan` is available, you are asked before each install (choice can be remembered) — `clamscan` reloads the DB and is heavy on RAM, so prefer `clamd` for bulk installs. AppImage/Flatpak sandboxes may not see the host daemon — then only the static check runs.
 
 This is a review aid, **not** a claim that plugins are malware-free or verified secure.
 

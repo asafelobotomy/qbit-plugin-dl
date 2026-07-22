@@ -163,6 +163,29 @@ def test_plugin_column_sort_key_version_and_date():
     ) < plugin_column_sort_key(newer, COL_INSTALLED, installed=False)
 
 
+def test_header_sections_remain_clickable_after_init():
+    """setSortingEnabled(False) must not leave column headers unclickable."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    from qbit_plugin_dl.gui import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    assert window.tree.header().sectionsClickable() is True
+    assert window.tree.isSortingEnabled() is False
+    window.close()
+    for worker in (
+        window._catalog_worker,
+        window._category_worker,
+        window._install_worker,
+        window._update_worker,
+    ):
+        if worker is not None and worker.isRunning():
+            worker.wait(2000)
+    assert app is not None
+
+
 def test_plugin_tree_item_sort_toggle_offscreen():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication, QTreeWidget
