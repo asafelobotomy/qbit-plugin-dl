@@ -104,3 +104,147 @@ def test_audit_plugin_bytes_without_clamav_session():
     report = audit_plugin_bytes(CLEAN_ENGINE_BYTES, filename="demo.py")
     assert not report.blocked
     assert report.clamav_backend == "none"
+
+
+def test_py2_shim_htmlparser_in_try_body_is_warn():
+    src = engine_source(
+        extra_imports=(
+            "try:\n"
+            "    from HTMLParser import HTMLParser\n"
+            "except ImportError:\n"
+            "    from html.parser import HTMLParser\n"
+        )
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert not report.blocked
+    assert any(f.code == "IMPORT_PY2_SHIM" for f in report.warn_findings)
+
+
+def test_py2_shim_htmlparser_in_except_is_warn():
+    src = engine_source(
+        extra_imports=(
+            "try:\n"
+            "    from html.parser import HTMLParser\n"
+            "except ImportError:\n"
+            "    from HTMLParser import HTMLParser\n"
+        )
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert not report.blocked
+    assert any(f.code == "IMPORT_PY2_SHIM" for f in report.warn_findings)
+
+
+def test_bare_htmlparser_still_blocked():
+    src = engine_source(extra_imports="from HTMLParser import HTMLParser\n")
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert report.blocked
+    assert any(f.code == "IMPORT_DENY" for f in report.fail_findings)
+
+
+def test_configparser_allowed():
+    src = engine_source(extra_imports="import configparser\n")
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert not report.blocked
+
+
+def test_threading_allowed():
+    src = engine_source(
+        extra_imports="import threading\n",
+        body=(
+            "t = threading.Thread(target=lambda: None)\n"
+            "        t.start()\n"
+            "        t.join()\n"
+            "        prettyPrinter({'name': what})"
+        ),
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert not report.blocked
+
+
+def test_thread_pool_executor_allowed():
+    src = engine_source(
+        extra_imports="from concurrent.futures import ThreadPoolExecutor\n",
+        body=(
+            "with ThreadPoolExecutor(max_workers=2) as ex:\n"
+            "            ex.submit(lambda: None)\n"
+            "        prettyPrinter({'name': what})"
+        ),
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert not report.blocked
+
+
+def test_multiprocessing_dummy_allowed():
+    src = engine_source(
+        extra_imports=(
+            "from multiprocessing.dummy import Pool\n"
+            "from threading import Lock\n"
+        ),
+        body=(
+            "with Pool(2) as pool:\n"
+            "            pool.map(lambda x: x, [1])\n"
+            "        prettyPrinter({'name': what})"
+        ),
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert not report.blocked
+
+
+def test_multiprocessing_process_blocked():
+    src = engine_source(extra_imports="from multiprocessing import Process\n")
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert report.blocked
+    assert any(
+        f.code in {"IMPORT_DENY", "PROCESS_EXEC"} for f in report.fail_findings
+    )
+
+
+def test_multiprocessing_module_blocked():
+    src = engine_source(extra_imports="import multiprocessing\n")
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert report.blocked
+    assert any(f.code == "IMPORT_DENY" for f in report.fail_findings)
+
+
+def test_process_pool_executor_import_blocked():
+    src = engine_source(
+        extra_imports="from concurrent.futures import ProcessPoolExecutor\n"
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert report.blocked
+    assert any(f.code == "PROCESS_EXEC" for f in report.fail_findings)
+
+
+def test_process_pool_executor_call_blocked():
+    src = engine_source(
+        extra_imports="import concurrent.futures\n",
+        body=(
+            "with concurrent.futures.ProcessPoolExecutor() as ex:\n"
+            "            pass\n"
+            "        prettyPrinter({'name': what})"
+        ),
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert report.blocked
+    assert any(f.code == "PROCESS_EXEC" for f in report.fail_findings)
+
+
+def test_jackett_style_concurrency_header_allowed():
+    """Official Jackett uses multiprocessing.dummy.Pool + threading.Lock."""
+    src = (
+        "from multiprocessing.dummy import Pool\n"
+        "from threading import Lock\n"
+        "from novaprinter import prettyPrinter\n"
+        "\n"
+        "class demo:\n"
+        '    url = "https://example.com"\n'
+        '    name = "Demo"\n'
+        '    supported_categories = {"all": ""}\n'
+        "\n"
+        "    def search(self, what, cat='all'):\n"
+        "        with Pool(2) as pool:\n"
+        "            pool.map(lambda x: x, [what])\n"
+        "        prettyPrinter({'name': what})\n"
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert not report.blocked

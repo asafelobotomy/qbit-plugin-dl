@@ -70,10 +70,24 @@ _ALLOWED_ROOT_MODULES: frozenset[str] = frozenset(
         "calendar",
         "email",
         "cgi",
+        "__future__",
+        "pathlib",
+        "zlib",
+        "queue",
+        "warnings",
+        "contextlib",
+        "operator",
+        "abc",
+        "types",
+        "configparser",
+        # In-process threads (Jackett + many community engines)
+        "threading",
+        "concurrent",
     }
 )
 
 # Root modules that are never allowed even if somehow listed elsewhere.
+# ``multiprocessing`` is denied except ``multiprocessing.dummy*`` (thread API).
 _DENIED_ROOT_MODULES: frozenset[str] = frozenset(
     {
         "subprocess",
@@ -94,8 +108,6 @@ _DENIED_ROOT_MODULES: frozenset[str] = frozenset(
         "xmlrpc",
         "socket",
         "asyncio",
-        "concurrent",
-        "threading",
         "signal",
         "fcntl",
         "resource",
@@ -114,6 +126,41 @@ _DENIED_ROOT_MODULES: frozenset[str] = frozenset(
 )
 
 _DENIED_HTTP_SUBMODULES: frozenset[str] = frozenset({"http.server"})
+
+# OS process spawning via concurrent.futures (threads are allowlisted above).
+_DENIED_CONCURRENT_SUBMODULES: frozenset[str] = frozenset(
+    {"concurrent.futures.process"}
+)
+
+_PROCESS_SPAWN_IMPORT_NAMES: frozenset[str] = frozenset(
+    {"ProcessPoolExecutor", "Process"}
+)
+
+_MULTIPROCESSING_PROCESS_ATTRS: frozenset[str] = frozenset(
+    {"Process", "Pool", "get_context", "Manager", "managers"}
+)
+
+# Imports that appear in try/except ImportError shims for Python 2/3 engines.
+# Seeing them in AST alone is not malware — qBittorrent runs Python 3.
+_PY2_COMPAT_MODULES: frozenset[str] = frozenset(
+    {
+        "HTMLParser",
+        "urllib2",
+        "urlparse",
+        "cookielib",
+        "Cookie",
+        "Queue",
+        "ConfigParser",
+        "cStringIO",
+        "StringIO",
+        "httplib",
+        "htmlentitydefs",
+        "commands",
+        "UserDict",
+        "UserList",
+        "UserString",
+    }
+)
 
 _DANGEROUS_BUILTINS: frozenset[str] = frozenset(
     {"exec", "eval", "compile", "__import__"}
@@ -223,9 +270,22 @@ def _root_module(name: str) -> str:
     return name.split(".", 1)[0]
 
 
+def _is_multiprocessing_dummy(fullname: str) -> bool:
+    """``multiprocessing.dummy`` is a thread pool API (used by official Jackett)."""
+    return fullname == "multiprocessing.dummy" or fullname.startswith(
+        "multiprocessing.dummy."
+    )
+
+
 def _import_allowed(fullname: str) -> bool:
     if fullname in _DENIED_HTTP_SUBMODULES:
         return False
+    if fullname in _DENIED_CONCURRENT_SUBMODULES or fullname.startswith(
+        "concurrent.futures.process."
+    ):
+        return False
+    if _is_multiprocessing_dummy(fullname):
+        return True
     root = _root_module(fullname)
     if root in _DENIED_ROOT_MODULES:
         return False
@@ -308,6 +368,7 @@ class _PolicyVisitor(ast.NodeVisitor):
         self.saw_dyn_exec = False
         self._in_function = 0
         self._class_stack: list[str] = []
+        self._py2_compat_depth = 0
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._in_function += 1
@@ -323,6 +384,30 @@ class _PolicyVisitor(ast.NodeVisitor):
         self._class_stack.append(node.name)
         self.generic_visit(node)
         self._class_stack.pop()
+
+    def visit_Try(self, node: ast.Try) -> None:
+        """Downgrade known Py2 imports inside ImportError compatibility shims.
+
+        Engines use both orientations:
+
+        - ``try: HTMLParser`` / ``except: html.parser``
+        - ``try: html.parser`` / ``except: HTMLParser``
+
+        so body *and* handlers must share the shim window.
+        """
+        if _try_handles_import_error(node):
+            self._py2_compat_depth += 1
+            for child in node.body:
+                self.visit(child)
+            for handler in node.handlers:
+                self.visit(handler)
+            self._py2_compat_depth -= 1
+            for child in node.orelse:
+                self.visit(child)
+            for child in node.finalbody:
+                self.visit(child)
+            return
+        self.generic_visit(node)
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -350,6 +435,7 @@ class _PolicyVisitor(ast.NodeVisitor):
             )
         if module:
             self._check_import(module, node.lineno)
+            self._check_import_from_names(module, node.names, node.lineno)
         elif node.level == 0:
             self.findings.append(
                 _finding(
@@ -359,9 +445,70 @@ class _PolicyVisitor(ast.NodeVisitor):
                 )
             )
 
+    def _check_import_from_names(
+        self,
+        module: str,
+        names: list[ast.alias],
+        lineno: int,
+    ) -> None:
+        """Catch process-spawn symbols even when the parent package is allowed."""
+        if _is_multiprocessing_dummy(module):
+            return
+        for alias in names:
+            if alias.name == "*":
+                continue
+            if alias.name in _PROCESS_SPAWN_IMPORT_NAMES:
+                self.findings.append(
+                    _finding(
+                        "PROCESS_EXEC",
+                        SEVERITY_FAIL,
+                        f"Process-spawning import {alias.name!r} from "
+                        f"{module!r} at line {lineno}",
+                    )
+                )
+            elif (
+                module.startswith("multiprocessing")
+                and alias.name in _MULTIPROCESSING_PROCESS_ATTRS
+            ):
+                self.findings.append(
+                    _finding(
+                        "PROCESS_EXEC",
+                        SEVERITY_FAIL,
+                        f"Process-spawning import {alias.name!r} from "
+                        f"{module!r} at line {lineno}",
+                    )
+                )
+
     def _check_import(self, name: str, lineno: int) -> None:
         root = _root_module(name)
-        if root in _DENIED_ROOT_MODULES or name in _DENIED_HTTP_SUBMODULES:
+        if (
+            self._py2_compat_depth > 0
+            and root in _PY2_COMPAT_MODULES
+        ):
+            self.findings.append(
+                _finding(
+                    "IMPORT_PY2_SHIM",
+                    SEVERITY_WARN,
+                    f"Python 2 compatibility import {name!r} at line {lineno}",
+                )
+            )
+            return
+        if _is_multiprocessing_dummy(name):
+            return
+        if (
+            name in _DENIED_HTTP_SUBMODULES
+            or name in _DENIED_CONCURRENT_SUBMODULES
+            or name.startswith("concurrent.futures.process.")
+        ):
+            self.findings.append(
+                _finding(
+                    "IMPORT_DENY",
+                    SEVERITY_FAIL,
+                    f"Denied import {name!r} at line {lineno}",
+                )
+            )
+            return
+        if root in _DENIED_ROOT_MODULES:
             self.findings.append(
                 _finding(
                     "IMPORT_DENY",
@@ -397,9 +544,43 @@ class _PolicyVisitor(ast.NodeVisitor):
             self._check_decode_exec_args(node)
             return
 
+        if isinstance(func, ast.Name) and func.id == "ProcessPoolExecutor":
+            self.findings.append(
+                _finding(
+                    "PROCESS_EXEC",
+                    SEVERITY_FAIL,
+                    f"ProcessPoolExecutor() at line {node.lineno}",
+                )
+            )
+            return
+
         chain = _attr_chain(func)
         if not chain:
             return
+
+        if chain[-1] == "ProcessPoolExecutor":
+            self.findings.append(
+                _finding(
+                    "PROCESS_EXEC",
+                    SEVERITY_FAIL,
+                    f"{'.'.join(chain)}() at line {node.lineno}",
+                )
+            )
+            return
+
+        if chain[0] == "multiprocessing":
+            if len(chain) >= 2 and chain[1] == "dummy":
+                pass  # thread API — allowed
+            elif len(chain) >= 2 and chain[1] in _MULTIPROCESSING_PROCESS_ATTRS:
+                self.findings.append(
+                    _finding(
+                        "PROCESS_EXEC",
+                        SEVERITY_FAIL,
+                        f"Process-spawning call {'.'.join(chain)}() "
+                        f"at line {node.lineno}",
+                    )
+                )
+                return
 
         if chain[0] == "os" and len(chain) >= 2 and chain[1] in _OS_DANGEROUS_ATTRS:
             self.findings.append(
@@ -526,7 +707,10 @@ class _PolicyVisitor(ast.NodeVisitor):
             chain = _attr_chain(node.value.func)
             if chain and (
                 (chain[0] in {"base64", "binascii", "codecs"} and chain[-1] in _DECODE_FUNCS)
-                or (isinstance(node.value.func, ast.Name) and node.value.func.id in _DECODE_FUNCS)
+                or (
+                    isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in _DECODE_FUNCS
+                )
             ):
                 self.saw_decode_call = True
                 for target in node.targets:
@@ -607,6 +791,32 @@ class _PolicyVisitor(ast.NodeVisitor):
                     )
                 )
         self.generic_visit(node)
+
+
+def _try_handles_import_error(node: ast.Try) -> bool:
+    for handler in node.handlers:
+        if handler.type is None:
+            continue
+        names = _exception_type_names(handler.type)
+        if names & {"ImportError", "ModuleNotFoundError"}:
+            return True
+        # Some older engines use bare ``except Exception`` around Py2 imports.
+        if names == {"Exception"}:
+            return True
+    return False
+
+
+def _exception_type_names(node: ast.AST) -> set[str]:
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, ast.Attribute):
+        return {node.attr}
+    if isinstance(node, ast.Tuple):
+        names: set[str] = set()
+        for elt in node.elts:
+            names |= _exception_type_names(elt)
+        return names
+    return set()
 
 
 def _check_line_heuristics(text: str) -> list[AuditFinding]:
