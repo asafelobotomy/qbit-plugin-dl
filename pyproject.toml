@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qbit-plugin-dl"
-version = "0.0.4"
+version = "0.1.4"
 description = "Selective installer for unofficial qBittorrent search plugins"
 # Canonical release version — keep in sync with ``__init__.__version__``.
 readme = "README.md"
