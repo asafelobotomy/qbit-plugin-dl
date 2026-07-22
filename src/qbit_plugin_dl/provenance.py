@@ -17,16 +17,12 @@ def installed_provenance_file() -> Path:
 
 
 def content_sha(data: str | bytes) -> str:
-    """Truncated SHA-256 matching categories cache style (legacy)."""
-    if isinstance(data, bytes):
-        text = data.decode("utf-8", errors="replace")
-    else:
-        text = data
-    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    """Truncated SHA-256 of raw bytes (first 16 hex chars of :func:`content_sha256`)."""
+    return content_sha256(data)[:16]
 
 
 def content_sha256(data: str | bytes) -> str:
-    """Full SHA-256 of raw bytes (strings encoded as UTF-8)."""
+    """Full SHA-256 of raw bytes (strings encoded as UTF-8, no error replacement)."""
     if isinstance(data, str):
         payload = data.encode("utf-8")
     else:

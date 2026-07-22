@@ -52,8 +52,8 @@ On first launch you must **Accept** the safety notice (persisted via Qt settings
 ## Threat model
 
 - Catalog entries come from allowlisted HTTPS sources only (MediaWiki list + GitHub Contents API for known repos). Download URLs use `raw.githubusercontent.com` or the wiki’s listed HTTPS links.
-- Downloads are **streamed** with a hard size abort, redirect cap, and **HTTPS-only** final URLs. Hosts `raw.githubusercontent.com` and `gist.githubusercontent.com` are auto-trusted; other HTTPS hosts need a one-time or “Always trust” confirmation (stored in Qt settings). Loopback / private / link-local / cloud-metadata addresses are rejected (DNS rebinding is not fully eliminated).
-- This app validates basenames, runs the static safety check (and optional ClamAV), and writes engines under the chosen `nova3/engines` directory with restrictive temp modes and atomic sidecar writes. It does **not** execute plugins.
+- Downloads are **streamed** with a hard size abort, redirect cap, and **HTTPS-only** final URLs. Hosts `raw.githubusercontent.com` and `gist.githubusercontent.com` are auto-trusted; other HTTPS hosts need a one-time or “Always trust” confirmation (asked before install, category resolve, and update checks). Loopback / private / link-local / cloud-metadata addresses are rejected (DNS rebinding is not fully eliminated).
+- This app validates basenames, runs the static safety check (and optional ClamAV — toggleable in the toolbar), and writes engines under the chosen `nova3/engines` directory with restrictive temp modes and atomic sidecar writes. It does **not** execute plugins.
 - The static check allows in-process threads (needed for Jackett and many engines) and blocks process spawning plus other high-risk APIs (`exec`, `subprocess`, `ctypes`, …). It is not a runtime sandbox.
 - Optional safe fixes (off by default): AST rewrites need ClamAV **clean** unless **Allow AST without ClamAV** is on; alternates may still run when ClamAV did not scan. Infected content is never “fixed” into place.
 - Provenance stores a full SHA-256 of installed bytes (plus a short `sha` for older caches). Update checks prefer the full hash when present.

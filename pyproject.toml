@@ -4,10 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qbit-plugin-dl"
-version = "0.0.3"
+version = "0.0.4"
 description = "Selective installer for unofficial qBittorrent search plugins"
-# Canonical release version. __init__.__version__ falls back to this string
-# when the package is not installed; importlib.metadata wins after install.
+# Canonical release version — keep in sync with ``__init__.__version__``.
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

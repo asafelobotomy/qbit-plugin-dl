@@ -39,6 +39,9 @@ def _plugin(**kwargs) -> Plugin:
 def test_content_sha_stable():
     assert content_sha("hello") == content_sha(b"hello")
     assert content_sha("a") != content_sha("b")
+    # Truncated hash is the prefix of the full raw-byte digest.
+    payload = b"raw\xffbytes"
+    assert content_sha(payload) == content_sha256(payload)[:16]
 
 
 def test_record_and_load_provenance(tmp_path: Path, monkeypatch):

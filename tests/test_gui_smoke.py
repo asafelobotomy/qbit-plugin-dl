@@ -17,11 +17,19 @@ from qbit_plugin_dl.gui import (
     COL_UPDATED,
     COL_VERSION,
     PluginTreeItem,
+    add_trusted_download_host,
     allow_ast_without_clamav_enabled,
     auto_fix_enabled,
+    clamav_enabled,
     format_install_summary,
+    hide_discouraged_enabled,
     plugin_column_sort_key,
     plugin_included_in_select_all,
+    preferred_engines_dir,
+    set_clamav_enabled,
+    set_hide_discouraged_enabled,
+    set_preferred_engines_dir,
+    trusted_download_hosts,
 )
 from qbit_plugin_dl.install import InstallResult
 from qbit_plugin_dl.main import main
@@ -335,6 +343,167 @@ def test_allow_ast_without_clamav_defaults_false():
     app.setApplicationName("qbit-plugin-dl-test-ast-clam")
     QSettings().remove("install/allow_ast_without_clamav")
     assert allow_ast_without_clamav_enabled() is False
+
+
+def test_clamav_enabled_setting_round_trip():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("qbit-plugin-dl-test-clamav-toggle")
+    app.setApplicationName("qbit-plugin-dl-test-clamav-toggle")
+    QSettings().remove("safety/clamav_enabled")
+    assert clamav_enabled() is True
+    set_clamav_enabled(False)
+    assert clamav_enabled() is False
+    set_clamav_enabled(True)
+    assert clamav_enabled() is True
+    assert app is not None
+
+
+def test_trusted_download_hosts_persist_always_trust():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("qbit-plugin-dl-test-trust-hosts")
+    app.setApplicationName("qbit-plugin-dl-test-trust-hosts")
+    QSettings().remove("security/trusted_download_hosts")
+    assert trusted_download_hosts() == set()
+    add_trusted_download_host("codeberg.org")
+    add_trusted_download_host("Scare.ca")
+    assert trusted_download_hosts() == {"codeberg.org", "scare.ca"}
+    assert app is not None
+
+
+def test_hide_discouraged_and_engines_dir_prefs(tmp_path: Path):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("qbit-plugin-dl-test-ui-prefs")
+    app.setApplicationName("qbit-plugin-dl-test-ui-prefs")
+    QSettings().remove("ui/hide_discouraged")
+    QSettings().remove("install/engines_dir")
+    assert hide_discouraged_enabled() is True
+    set_hide_discouraged_enabled(False)
+    assert hide_discouraged_enabled() is False
+    target = tmp_path / "engines"
+    set_preferred_engines_dir(target)
+    assert preferred_engines_dir() == target
+    set_preferred_engines_dir(None)
+    assert preferred_engines_dir() is None
+    assert app is not None
+
+
+def test_main_window_clamav_checkbox_and_fix_tooltip(tmp_path: Path, monkeypatch):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItem
+
+    from qbit_plugin_dl.gui import MainWindow
+    from qbit_plugin_dl.provenance import record_install_provenance
+
+    record_install_provenance(
+        "demo.py",
+        download_url="https://example.com/demo.py",
+        sha="abc",
+        fixed=True,
+        rewritten=True,
+        fix_kinds=["py2_imports"],
+    )
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    assert window.clamav_cb.isChecked() is True
+    window._fixed = {"demo.py"}
+    window._installed = {"demo.py"}
+    window._updates = set()
+    item = QTreeWidgetItem()
+    window._fill_plugin_item(item, _plugin())
+    tip = item.toolTip(COL_NAME).lower()
+    assert "safe fix" in tip
+    assert "clamav ran" not in tip
+    window.close()
+    assert app is not None
+
+
+def test_prompt_untrusted_hosts_session_and_decline(tmp_path: Path, monkeypatch):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from qbit_plugin_dl.gui import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("qbit-plugin-dl-test-prompt-trust")
+    app.setApplicationName("qbit-plugin-dl-test-prompt-trust")
+    QSettings().remove("security/trusted_download_hosts")
+
+    window = MainWindow()
+    plugin = _plugin(download_url="https://codeberg.org/x/y/raw/branch/main/yts.py")
+    chosen: dict[str, object] = {}
+
+    def fake_exec(self):  # noqa: ANN001
+        for btn in self.buttons():
+            if btn.text() == "Trust once":
+                chosen["btn"] = btn
+                return 0
+        chosen["btn"] = None
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    monkeypatch.setattr(
+        QMessageBox,
+        "clickedButton",
+        lambda self: chosen.get("btn"),
+    )
+    assert window._prompt_untrusted_hosts([plugin], purpose="install") is True
+    assert "codeberg.org" in window._session_trusted_hosts
+    assert "codeberg.org" not in trusted_download_hosts()
+
+    # Declined hosts are not re-prompted (cancel path).
+    other = _plugin(download_url="https://scare.ca/dl/qBittorrent/x.py")
+    chosen.clear()
+
+    def cancel_exec(self):  # noqa: ANN001
+        for btn in self.buttons():
+            if btn.text() == "Cancel":
+                chosen["btn"] = btn
+                return 0
+        chosen["btn"] = self.buttons()[-1]
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", cancel_exec)
+    assert (
+        window._prompt_untrusted_hosts(
+            [other], purpose="category resolve", required=False
+        )
+        is True
+    )
+    assert "scare.ca" in window._declined_download_hosts
+    # Second call skips dialog because declined.
+    calls = {"n": 0}
+
+    def boom(self):  # noqa: ANN001
+        calls["n"] += 1
+        raise AssertionError("should not re-prompt declined host")
+
+    monkeypatch.setattr(QMessageBox, "exec", boom)
+    assert (
+        window._prompt_untrusted_hosts(
+            [other], purpose="category resolve", required=False
+        )
+        is True
+    )
+    assert calls["n"] == 0
+    window.close()
+    assert app is not None
 
 
 def test_main_window_ast_checkbox_default_unchecked():

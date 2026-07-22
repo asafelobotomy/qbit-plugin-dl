@@ -639,6 +639,39 @@ def clamav_enabled() -> bool:
     return bool(_settings().value("safety/clamav_enabled", True, type=bool))
 
 
+def set_clamav_enabled(enabled: bool) -> None:
+    settings = _settings()
+    settings.setValue("safety/clamav_enabled", enabled)
+    settings.sync()
+
+
+def hide_discouraged_enabled() -> bool:
+    return bool(_settings().value("ui/hide_discouraged", True, type=bool))
+
+
+def set_hide_discouraged_enabled(enabled: bool) -> None:
+    settings = _settings()
+    settings.setValue("ui/hide_discouraged", enabled)
+    settings.sync()
+
+
+def preferred_engines_dir() -> Path | None:
+    raw = _settings().value("install/engines_dir", "", type=str)
+    text = str(raw).strip() if raw is not None else ""
+    if not text:
+        return None
+    return Path(text)
+
+
+def set_preferred_engines_dir(path: Path | None) -> None:
+    settings = _settings()
+    if path is None:
+        settings.remove("install/engines_dir")
+    else:
+        settings.setValue("install/engines_dir", str(path))
+    settings.sync()
+
+
 def auto_fix_enabled() -> bool:
     """Whether safe install-time fixes are enabled (default off)."""
     return bool(_settings().value("install/auto_fix", False, type=bool))
@@ -970,7 +1003,9 @@ class MainWindow(QMainWindow):
         self._fixed: set[str] = set()
         self._updates: set[str] = set()
         self._session_trusted_hosts: set[str] = set()
-        self._engines_dir = resolve_install_dir()
+        self._declined_download_hosts: set[str] = set()
+        preferred = preferred_engines_dir()
+        self._engines_dir = resolve_install_dir(preferred=preferred)
         self._catalog_worker: CatalogWorker | None = None
         self._category_worker: CategoryWorker | None = None
         self._install_worker: InstallWorker | None = None
@@ -1016,9 +1051,18 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.category_combo)
 
         self.hide_discouraged = QCheckBox("Hide discouraged")
-        self.hide_discouraged.setChecked(True)
-        self.hide_discouraged.stateChanged.connect(self.apply_filters)
+        self.hide_discouraged.setChecked(hide_discouraged_enabled())
+        self.hide_discouraged.stateChanged.connect(self._on_hide_discouraged_toggled)
         toolbar.addWidget(self.hide_discouraged)
+
+        self.clamav_cb = QCheckBox("ClamAV scan")
+        self.clamav_cb.setChecked(clamav_enabled())
+        self.clamav_cb.setToolTip(
+            "When enabled, prefer clamd / optional clamscan before install. "
+            "Static safety checks always run."
+        )
+        self.clamav_cb.stateChanged.connect(self._on_clamav_toggled)
+        toolbar.addWidget(self.clamav_cb)
 
         self.auto_fix_cb = QCheckBox("Safe fixes during install")
         self.auto_fix_cb.setChecked(auto_fix_enabled())
@@ -1170,6 +1214,7 @@ class MainWindow(QMainWindow):
                 "When ClamAV is available it prefers a running <code>clamd</code> "
                 "(via <code>clamdscan --fdpass</code>); one-shot "
                 "<code>clamscan</code> needs your consent. Optional "
+                "<b>ClamAV scan</b> can be turned off in the toolbar. Optional "
                 "<b>Safe fixes during install</b> (off by default) may try "
                 "alternate catalog forks and allowlisted AST rewrites. AST "
                 "rewrites require a <b>clean</b> ClamAV result unless "
@@ -1223,6 +1268,7 @@ class MainWindow(QMainWindow):
         path = self.path_combo.currentData()
         if isinstance(path, Path):
             self._engines_dir = path
+            set_preferred_engines_dir(path)
             self._refresh_installed()
             self._rebuild_tree()
             self._start_update_check()
@@ -1235,6 +1281,7 @@ class MainWindow(QMainWindow):
         )
         if chosen:
             self._engines_dir = Path(chosen)
+            set_preferred_engines_dir(self._engines_dir)
             self._populate_path_combo()
             self._rebuild_tree()
             self._start_update_check()
@@ -1249,19 +1296,34 @@ class MainWindow(QMainWindow):
     def _on_ast_without_clam_toggled(self, _state: int = 0) -> None:
         set_allow_ast_without_clamav_enabled(self.ast_without_clam_cb.isChecked())
 
+    def _on_clamav_toggled(self, _state: int = 0) -> None:
+        set_clamav_enabled(self.clamav_cb.isChecked())
+
+    def _on_hide_discouraged_toggled(self, _state: int = 0) -> None:
+        set_hide_discouraged_enabled(self.hide_discouraged.isChecked())
+        self.apply_filters()
+
     def _effective_trusted_hosts(self) -> set[str]:
         return trusted_download_hosts() | self._session_trusted_hosts
 
-    def _prompt_untrusted_hosts(self, plugins: list[Plugin]) -> bool:
+    def _prompt_untrusted_hosts(
+        self,
+        plugins: list[Plugin],
+        *,
+        purpose: str = "install",
+        required: bool = True,
+    ) -> bool:
         """
         Pre-prompt for non-allowlisted hosts on catalog URLs.
 
-        Returns False if the user cancels.
+        When *required* is True (install), Cancel aborts. When False
+        (categories / updates), Cancel continues without trusting new hosts.
         """
         unknown = untrusted_hosts_in_urls(
             (p.download_url for p in plugins),
             trusted_hosts=self._effective_trusted_hosts(),
         )
+        unknown = [h for h in unknown if h not in self._declined_download_hosts]
         if not unknown:
             return True
 
@@ -1278,12 +1340,12 @@ class MainWindow(QMainWindow):
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("Untrusted download hosts")
         box.setText(
-            "Some selected plugins download from hosts that are not on the "
+            "Some plugins download from hosts that are not on the "
             "built-in allowlist (raw.githubusercontent.com / "
             "gist.githubusercontent.com)."
         )
         box.setInformativeText(
-            "Approve to continue this install:\n\n" + "\n\n".join(examples)
+            f"Approve to continue this {purpose}:\n\n" + "\n\n".join(examples)
         )
         once_btn = box.addButton("Trust once", QMessageBox.ButtonRole.AcceptRole)
         always_btn = box.addButton("Always trust", QMessageBox.ButtonRole.YesRole)
@@ -1297,7 +1359,8 @@ class MainWindow(QMainWindow):
             for host in unknown:
                 add_trusted_download_host(host)
             return True
-        return False
+        self._declined_download_hosts.update(unknown)
+        return not required
 
     def _plugin_key(self, plugin: Plugin) -> tuple[str, str]:
         return (plugin.name, plugin.download_url)
@@ -1353,7 +1416,7 @@ class MainWindow(QMainWindow):
             kind_txt = ", ".join(kinds) if kinds else "safe install-time fix"
             item.setToolTip(
                 COL_NAME,
-                f"Installed with safe fix ({kind_txt}). ClamAV ran before rewrite.",
+                f"Installed with safe fix ({kind_txt}).",
             )
         elif plugin.warning:
             item.setToolTip(COL_NAME, "Discouraged by upstream wiki")
@@ -1403,6 +1466,11 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.status_label.setText(
             f"Resolving categories… 0/{len(self._all_plugins)}"
+        )
+        self._prompt_untrusted_hosts(
+            self._all_plugins,
+            purpose="category resolve",
+            required=False,
         )
         worker = CategoryWorker(
             self._all_plugins,
@@ -1492,6 +1560,14 @@ class MainWindow(QMainWindow):
             self._status_updates_suffix = ""
             self._sync_update_all_button()
             return
+        installed = [
+            p for p in self._all_plugins if p.filename in self._installed
+        ]
+        self._prompt_untrusted_hosts(
+            installed,
+            purpose="update check",
+            required=False,
+        )
         worker = UpdateCheckWorker(
             self._engines_dir,
             list(self._all_plugins),

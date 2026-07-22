@@ -24,6 +24,14 @@ def test_exec_blocked():
     assert any(f.code == "DYN_EXEC" for f in report.fail_findings)
 
 
+def test_dangerous_builtin_reference_warned():
+    src = engine_source(body="handler = eval\n")
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert not report.blocked
+    assert any(f.code == "BUILTIN_REF" for f in report.findings)
+    assert any("eval" in f.message for f in report.findings)
+
+
 def test_os_system_blocked():
     src = engine_source(extra_imports="import os\n", body="os.system('id')")
     report = audit_plugin_static(src.encode(), filename="demo.py")

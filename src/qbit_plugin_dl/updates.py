@@ -78,13 +78,6 @@ def local_file_sha(path: Path) -> str | None:
         return None
 
 
-def local_file_sha256(path: Path) -> str | None:
-    try:
-        return content_sha256(path.read_bytes())
-    except OSError:
-        return None
-
-
 def remote_sha_from_cache(
     download_url: str,
     categories_cache: Mapping[str, dict] | None = None,

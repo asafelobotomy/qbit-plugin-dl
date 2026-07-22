@@ -777,8 +777,14 @@ class _PolicyVisitor(ast.NodeVisitor):
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Load) and node.id in _DANGEROUS_BUILTINS:
-            # Reference without call still suspicious when assigned/passed
-            pass
+            self.findings.append(
+                _finding(
+                    "BUILTIN_REF",
+                    SEVERITY_WARN,
+                    f"Dangerous builtin {node.id!r} referenced at line "
+                    f"{node.lineno} (not called here)",
+                )
+            )
         if isinstance(node.ctx, ast.Store):
             normalized = unicodedata.normalize("NFKC", node.id)
             if normalized != node.id or any(ord(ch) > 127 for ch in node.id):
