@@ -42,6 +42,8 @@ from qbit_plugin_dl.catalog import (
     fetch_catalog,
     filter_plugins,
     group_plugins_for_display,
+    parse_wiki_date,
+    parse_wiki_version,
 )
 from qbit_plugin_dl.categories import (
     ADULT_CATEGORY,
@@ -89,11 +91,80 @@ COLS = (
     "Installed",
 )
 
+# Column indices for sort-key helpers / tests.
+COL_CHECK = 0
+COL_NAME = 1
+COL_VISIBILITY = 2
+COL_CATEGORIES = 3
+COL_VERSION = 4
+COL_UPDATED = 5
+COL_AUTHOR = 6
+COL_SOURCE = 7
+COL_COMMENTS = 8
+COL_INSTALLED = 9
+
 SOURCE_LABELS = {
     "wiki": "Wiki",
     "official": "Official",
     "lightdestory": "LightDestory",
 }
+
+
+def plugin_column_sort_key(
+    plugin: Plugin,
+    column: int,
+    *,
+    checked: bool = False,
+    installed: bool = False,
+    has_update: bool = False,
+) -> tuple:
+    """Return a comparable sort key for a plugin column."""
+    if column == COL_CHECK:
+        return (0 if checked else 1,)
+    if column == COL_NAME:
+        return (plugin.name.casefold(),)
+    if column == COL_VISIBILITY:
+        return (plugin.visibility.value,)
+    if column == COL_CATEGORIES:
+        return (format_categories(plugin.categories).casefold(),)
+    if column == COL_VERSION:
+        return (parse_wiki_version(plugin.version), plugin.version.casefold())
+    if column == COL_UPDATED:
+        return (parse_wiki_date(plugin.last_update), plugin.last_update.casefold())
+    if column == COL_AUTHOR:
+        return (plugin.author.casefold(),)
+    if column == COL_SOURCE:
+        return (SOURCE_LABELS.get(plugin.source_id, plugin.source_id).casefold(),)
+    if column == COL_COMMENTS:
+        return (plugin.comments.casefold(),)
+    if column == COL_INSTALLED:
+        return (0 if installed else 1,)
+    return (plugin.name.casefold(),)
+
+
+class PluginTreeItem(QTreeWidgetItem):
+    """Tree row with type-aware column sorting (version/date/check/installed)."""
+
+    def __lt__(self, other: QTreeWidgetItem) -> bool:
+        tree = self.treeWidget()
+        column = tree.sortColumn() if tree is not None else 0
+        left = self._sort_key(column)
+        if isinstance(other, PluginTreeItem):
+            right = other._sort_key(column)
+        else:
+            right = (other.text(column).casefold(),)
+        return left < right
+
+    def _sort_key(self, column: int) -> tuple:
+        plugin = self.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(plugin, Plugin):
+            return (self.text(column).casefold(),)
+        return plugin_column_sort_key(
+            plugin,
+            column,
+            checked=self.checkState(0) == Qt.CheckState.Checked,
+            installed=self.text(COL_INSTALLED) == "Yes",
+        )
 
 
 def format_install_summary(
@@ -474,7 +545,15 @@ class MainWindow(QMainWindow):
         self.tree.setColumnWidth(6, 120)
         self.tree.setColumnWidth(7, 90)
         self.tree.setColumnWidth(8, 220)
-        self.tree.header().setStretchLastSection(True)
+        header = self.tree.header()
+        header.setStretchLastSection(True)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        # Manual sort on click so catalog order is kept until the user sorts.
+        self._sort_column: int | None = None
+        self._sort_order = Qt.SortOrder.AscendingOrder
+        header.sectionClicked.connect(self._on_header_section_clicked)
+        self.tree.setSortingEnabled(False)
         self.tree.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.tree, stretch=1)
 
@@ -787,17 +866,40 @@ class MainWindow(QMainWindow):
         if message:
             QMessageBox.warning(self, "Update check", message)
 
+    def _on_header_section_clicked(self, section: int) -> None:
+        """Toggle ascending/descending sort for the clicked column."""
+        if section < 0 or section >= len(COLS):
+            return
+        if self._sort_column == section:
+            self._sort_order = (
+                Qt.SortOrder.DescendingOrder
+                if self._sort_order == Qt.SortOrder.AscendingOrder
+                else Qt.SortOrder.AscendingOrder
+            )
+        else:
+            self._sort_column = section
+            self._sort_order = Qt.SortOrder.AscendingOrder
+        self._apply_tree_sort()
+
+    def _apply_tree_sort(self) -> None:
+        if self._sort_column is None:
+            return
+        header = self.tree.header()
+        header.setSortIndicator(self._sort_column, self._sort_order)
+        self.tree.sortItems(self._sort_column, self._sort_order)
+
     def _rebuild_tree(self) -> None:
         self.tree.blockSignals(True)
         self.tree.clear()
         for group in group_plugins_for_display(self._visible_plugins):
-            parent = QTreeWidgetItem(self.tree)
+            parent = PluginTreeItem(self.tree)
             self._fill_plugin_item(parent, group.primary)
             for alternate in group.alternates:
-                child = QTreeWidgetItem(parent)
+                child = PluginTreeItem(parent)
                 self._fill_plugin_item(child, alternate)
             parent.setExpanded(False)
         self.tree.blockSignals(False)
+        self._apply_tree_sort()
 
     def _uncheck_filename_conflicts(
         self,

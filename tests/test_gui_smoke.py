@@ -5,11 +5,21 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import Qt
 
 from qbit_plugin_dl import __version__
 from qbit_plugin_dl.audit import AuditFinding, AuditReport
 from qbit_plugin_dl.catalog import Plugin, Visibility
-from qbit_plugin_dl.gui import format_install_summary, plugin_included_in_select_all
+from qbit_plugin_dl.gui import (
+    COL_INSTALLED,
+    COL_NAME,
+    COL_UPDATED,
+    COL_VERSION,
+    PluginTreeItem,
+    format_install_summary,
+    plugin_column_sort_key,
+    plugin_included_in_select_all,
+)
 from qbit_plugin_dl.install import InstallResult
 from qbit_plugin_dl.main import main
 
@@ -134,3 +144,40 @@ def test_format_install_summary_mixed_failures(tmp_path: Path):
     assert "Failed: 1" in msg
     assert "Safety check blocked: 1" in msg
     assert "Blocked by safety check:" in msg
+
+
+def test_plugin_column_sort_key_version_and_date():
+    older = _plugin(name="B", version="1.2", last_update="01 Jan 2020")
+    newer = _plugin(name="A", version="1.10", last_update="15 Mar 2024")
+    assert plugin_column_sort_key(older, COL_VERSION) < plugin_column_sort_key(
+        newer, COL_VERSION
+    )
+    assert plugin_column_sort_key(older, COL_UPDATED) < plugin_column_sort_key(
+        newer, COL_UPDATED
+    )
+    assert plugin_column_sort_key(newer, COL_NAME) < plugin_column_sort_key(
+        older, COL_NAME
+    )
+    assert plugin_column_sort_key(
+        older, COL_INSTALLED, installed=True
+    ) < plugin_column_sort_key(newer, COL_INSTALLED, installed=False)
+
+
+def test_plugin_tree_item_sort_toggle_offscreen():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QTreeWidget
+
+    app = QApplication.instance() or QApplication([])
+    tree = QTreeWidget()
+    tree.setColumnCount(COL_NAME + 1)
+    a = PluginTreeItem(tree)
+    a.setData(0, Qt.ItemDataRole.UserRole, _plugin(name="Zed"))
+    a.setText(COL_NAME, "Zed")
+    b = PluginTreeItem(tree)
+    b.setData(0, Qt.ItemDataRole.UserRole, _plugin(name="Ada"))
+    b.setText(COL_NAME, "Ada")
+    tree.sortItems(COL_NAME, Qt.SortOrder.AscendingOrder)
+    assert tree.topLevelItem(0).text(COL_NAME) == "Ada"
+    tree.sortItems(COL_NAME, Qt.SortOrder.DescendingOrder)
+    assert tree.topLevelItem(0).text(COL_NAME) == "Zed"
+    assert app is not None
