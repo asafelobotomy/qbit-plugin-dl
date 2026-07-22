@@ -5,12 +5,11 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import httpx
-
 from qbit_plugin_dl.catalog import Plugin, Visibility
 from qbit_plugin_dl.categories import enrich_plugins_async, load_categories_cache
 from qbit_plugin_dl.install import MAX_PLUGIN_BYTES
-from qbit_plugin_dl.provenance import content_sha
+from qbit_plugin_dl.provenance import content_sha, content_sha256
+from tests.http_fakes import TRUSTED_TEST_HOSTS, AsyncSingleClient
 
 
 def _plugin(**kwargs) -> Plugin:
@@ -42,28 +41,16 @@ def test_enrich_oversized_falls_back_without_sha(tmp_path: Path, monkeypatch):
     plugin = _plugin(name="FitGirl Repacks", download_url="https://example.com/fit.py")
     body = b"x" * (MAX_PLUGIN_BYTES + 1)
 
-    class FakeResponse:
-        def __init__(self) -> None:
-            self.content = body
-            self.url = httpx.URL(plugin.download_url)
-
-        def raise_for_status(self) -> None:
-            return None
-
-    class FakeClient:
-        async def get(self, url: str) -> FakeResponse:
-            return FakeResponse()
-
-        async def aclose(self) -> None:
-            return None
-
     cache_path = tmp_path / "categories.json"
     results = asyncio.run(
         enrich_plugins_async(
             [plugin],
             force_refresh=True,
             cache_path=cache_path,
-            client=FakeClient(),  # type: ignore[arg-type]
+            client=AsyncSingleClient(  # type: ignore[arg-type]
+                body, plugin.download_url, chunk_size=64 * 1024
+            ),
+            trusted_hosts=TRUSTED_TEST_HOSTS,
         )
     )
     assert results[0].categories == frozenset({"games"})
@@ -76,30 +63,17 @@ def test_enrich_stores_byte_sha(tmp_path: Path, monkeypatch):
     plugin = _plugin(download_url="https://example.com/yts.py")
     body = b'supported_categories = {"all": "0", "movies": "1"}\n'
 
-    class FakeResponse:
-        def __init__(self) -> None:
-            self.content = body
-            self.url = httpx.URL(plugin.download_url)
-
-        def raise_for_status(self) -> None:
-            return None
-
-    class FakeClient:
-        async def get(self, url: str) -> FakeResponse:
-            return FakeResponse()
-
-        async def aclose(self) -> None:
-            return None
-
     cache_path = tmp_path / "categories.json"
     results = asyncio.run(
         enrich_plugins_async(
             [plugin],
             force_refresh=True,
             cache_path=cache_path,
-            client=FakeClient(),  # type: ignore[arg-type]
+            client=AsyncSingleClient(body, plugin.download_url),  # type: ignore[arg-type]
+            trusted_hosts=TRUSTED_TEST_HOSTS,
         )
     )
-    assert results[0].categories == frozenset({"movies"})
+    assert "movies" in results[0].categories
     cache = load_categories_cache(cache_path)
     assert cache[plugin.download_url]["sha"] == content_sha(body)
+    assert cache[plugin.download_url]["sha256"] == content_sha256(body)

@@ -7,16 +7,21 @@ import asyncio
 import json
 import re
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import replace
 from pathlib import Path
 
 import httpx
 
 from qbit_plugin_dl.catalog import Plugin
-from qbit_plugin_dl.install import MAX_PLUGIN_BYTES, require_https_url
-from qbit_plugin_dl.paths import cache_dir
-from qbit_plugin_dl.provenance import content_sha
+from qbit_plugin_dl.fetch import (
+    MAX_PLUGIN_BYTES,
+    MAX_REDIRECTS,
+    FetchError,
+    fetch_plugin_bytes_async,
+)
+from qbit_plugin_dl.paths import atomic_write_text, cache_dir
+from qbit_plugin_dl.provenance import content_sha, content_sha256
 
 QBIT_CATEGORIES = (
     "anime",
@@ -209,8 +214,10 @@ def save_categories_cache(
     path: Path | None = None,
 ) -> None:
     path = path or categories_cache_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+    atomic_write_text(
+        path,
+        json.dumps(cache, indent=2, sort_keys=True),
+    )
 
 
 def categories_from_cache_entry(entry: dict | None) -> frozenset[str] | None:
@@ -247,6 +254,7 @@ async def _enrich_one(
     semaphore: asyncio.Semaphore,
     *,
     force_refresh: bool,
+    trusted_hosts: Collection[str] | None = None,
 ) -> Plugin:
     if not force_refresh:
         async with cache_lock:
@@ -257,19 +265,18 @@ async def _enrich_one(
     async with semaphore:
         source: str | None = None
         content_bytes: bytes | None = None
-        try:
-            require_https_url(plugin.download_url)
-            response = await client.get(plugin.download_url)
-            response.raise_for_status()
-            require_https_url(str(response.url))
-            content_bytes = response.content
-            if len(content_bytes) > MAX_PLUGIN_BYTES or not content_bytes.strip():
-                content_bytes = None
-            else:
-                source = content_bytes.decode("utf-8", errors="replace")
-        except Exception:  # noqa: BLE001 - fall back to heuristics
+        result = await fetch_plugin_bytes_async(
+            client,
+            plugin.download_url,
+            max_bytes=MAX_PLUGIN_BYTES,
+            trusted_hosts=trusted_hosts,
+        )
+        if isinstance(result, FetchError):
             source = None
             content_bytes = None
+        else:
+            content_bytes = result.content
+            source = content_bytes.decode("utf-8", errors="replace")
 
     cats = resolve_categories(
         name=plugin.name,
@@ -279,6 +286,7 @@ async def _enrich_one(
     entry = {
         "categories": sorted(cats),
         "sha": content_sha(content_bytes) if content_bytes is not None else None,
+        "sha256": content_sha256(content_bytes) if content_bytes is not None else None,
         "fetched_at": time.time(),
     }
     async with cache_lock:
@@ -294,6 +302,7 @@ async def enrich_plugins_async(
     cache_path: Path | None = None,
     on_progress: ProgressCallback | None = None,
     client: httpx.AsyncClient | None = None,
+    trusted_hosts: Collection[str] | None = None,
 ) -> list[Plugin]:
     """Fetch plugin sources and attach categories; update disk cache."""
     if not plugins:
@@ -303,7 +312,11 @@ async def enrich_plugins_async(
     cache = {} if force_refresh else load_categories_cache(cache_path)
     owns_client = client is None
     if client is None:
-        client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        client = httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            max_redirects=MAX_REDIRECTS,
+        )
 
     semaphore = asyncio.Semaphore(concurrency)
     cache_lock = asyncio.Lock()
@@ -321,6 +334,7 @@ async def enrich_plugins_async(
                     cache_lock,
                     semaphore,
                     force_refresh=force_refresh,
+                    trusted_hosts=trusted_hosts,
                 )
             )
             for plugin in plugins
@@ -346,6 +360,7 @@ def enrich_plugins(
     concurrency: int = 6,
     cache_path: Path | None = None,
     on_progress: ProgressCallback | None = None,
+    trusted_hosts: Collection[str] | None = None,
 ) -> list[Plugin]:
     """Synchronous wrapper around enrich_plugins_async."""
     return asyncio.run(
@@ -355,6 +370,7 @@ def enrich_plugins(
             concurrency=concurrency,
             cache_path=cache_path,
             on_progress=on_progress,
+            trusted_hosts=trusted_hosts,
         )
     )
 

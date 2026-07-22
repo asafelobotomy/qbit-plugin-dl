@@ -14,7 +14,7 @@ from typing import Iterable, Sequence
 
 import httpx
 
-from qbit_plugin_dl.paths import cache_dir
+from qbit_plugin_dl.paths import atomic_write_text, cache_dir
 
 CATALOG_URL = (
     "https://raw.githubusercontent.com/qbittorrent/search-plugins/"
@@ -504,8 +504,7 @@ def load_cached_catalog(path: Path | None = None) -> str | None:
 
 def save_catalog_cache(text: str, path: Path | None = None) -> None:
     path = path or catalog_cache_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    atomic_write_text(path, text)
 
 
 def fetch_catalog(

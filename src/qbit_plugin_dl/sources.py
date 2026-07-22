@@ -23,6 +23,7 @@ from qbit_plugin_dl.catalog import (
     save_catalog_cache,
     sources_cache_dir,
 )
+from qbit_plugin_dl.paths import atomic_write_text
 
 GITHUB_API_ACCEPT = "application/vnd.github+json"
 GITHUB_API_VERSION = "2022-11-28"
@@ -192,9 +193,9 @@ class GitHubEnginesProvider:
             response.raise_for_status()
             payload = response.json()
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(
+            atomic_write_text(
+                cache_path,
                 json.dumps(payload, indent=2, sort_keys=True),
-                encoding="utf-8",
             )
             # Touch mtime explicitly for freshness.
             cache_path.touch()
