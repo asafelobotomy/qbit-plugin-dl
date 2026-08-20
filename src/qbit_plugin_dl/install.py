@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import httpx
@@ -33,6 +33,10 @@ from qbit_plugin_dl.provenance import (
     content_sha256,
     record_install_provenance,
     remove_install_provenance,
+)
+from qbit_plugin_dl.url_recover import (
+    is_http_not_found,
+    recover_github_raw_url_async,
 )
 
 
@@ -385,8 +389,8 @@ async def _fetch_plugin_bytes(
     plugin: Plugin,
     *,
     trusted_hosts: Collection[str] | None = None,
-) -> tuple[bytes | None, str | None]:
-    """Return (content, error). error set on failure."""
+) -> tuple[bytes | None, str | None, FetchError | None]:
+    """Return (content, error_message, fetch_error)."""
     result = await fetch_plugin_bytes_async(
         client,
         plugin.download_url,
@@ -394,8 +398,8 @@ async def _fetch_plugin_bytes(
         trusted_hosts=trusted_hosts,
     )
     if isinstance(result, FetchError):
-        return None, result.message
-    return result.content, None
+        return None, result.message, result
+    return result.content, None, None
 
 
 def _write_engine(
@@ -406,12 +410,14 @@ def _write_engine(
     engines_dir: Path,
     fix: FixReport | None,
     source_bytes: bytes | None = None,
+    install_filename: str | None = None,
 ) -> InstallResult:
     dest_tmp = Path(str(dest) + ".tmp")
     provenance_error: str | None = None
+    provenance_name = install_filename or plugin.filename
     try:
         # Re-validate containment immediately before replace (symlink TOCTOU).
-        dest = resolve_plugin_dest(engines_dir, plugin.filename)
+        dest = resolve_plugin_dest(engines_dir, provenance_name)
         dest_tmp = Path(str(dest) + ".tmp")
         fd = os.open(
             dest_tmp,
@@ -447,7 +453,7 @@ def _write_engine(
     try:
         kinds = [k.value for k in (fix.kinds if fix else ())]
         record_install_provenance(
-            plugin.filename,
+            provenance_name,
             download_url=plugin.download_url,
             sha=written_sha,
             sha256=written_sha256,
@@ -482,13 +488,14 @@ async def _install_plugin_with_optional_fix(
     tried_urls: list[str] = []
     current = plugin
     alternate_used = False
+    install_filename = plugin.filename
 
     while True:
         tried_urls.append(current.download_url)
         ast_kinds_this_round: list[FixKind] = []
         source_bytes_before_ast: bytes | None = None
         try:
-            dest = resolve_plugin_dest(engines_dir, current.filename)
+            dest = resolve_plugin_dest(engines_dir, install_filename)
         except ValueError as exc:
             return InstallResult(
                 plugin=plugin,
@@ -497,10 +504,20 @@ async def _install_plugin_with_optional_fix(
                 error=str(exc),
             )
 
-        content, fetch_error = await _fetch_plugin_bytes(
+        content, fetch_error, fetch_err_obj = await _fetch_plugin_bytes(
             client, current, trusted_hosts=trusted_hosts
         )
         if content is None:
+            # Stale wiki raw path — recover moved/renamed blob in the same repo.
+            if is_http_not_found(fetch_err_obj or fetch_error):
+                recovered = await recover_github_raw_url_async(
+                    client,
+                    current.download_url,
+                    basename=install_filename,
+                )
+                if recovered and recovered not in tried_urls:
+                    current = replace(current, download_url=recovered)
+                    continue
             # Network / size / host failure — try alternate if auto_fix.
             if auto_fix:
                 nxt = ranked_alternates(
@@ -529,7 +546,7 @@ async def _install_plugin_with_optional_fix(
             report = await asyncio.to_thread(
                 audit_clamav_then_static,
                 content,
-                filename=current.filename,
+                filename=install_filename,
                 clamav_session=clamav_session,
             )
             if report.clamav_status == "infected":
@@ -552,7 +569,7 @@ async def _install_plugin_with_optional_fix(
                 content, report, ast_kinds_this_round = await asyncio.to_thread(
                     try_ast_fix_after_clamav,
                     content,
-                    filename=current.filename,
+                    filename=install_filename,
                     clamav_session=clamav_session,
                     prior_report=report,
                     allow_ast_without_clamav=allow_ast_without_clamav,
@@ -588,6 +605,7 @@ async def _install_plugin_with_optional_fix(
                     engines_dir=engines_dir,
                     fix=fix_report,
                     source_bytes=source_bytes_before_ast,
+                    install_filename=install_filename,
                 )
                 return InstallResult(
                     plugin=current,
@@ -626,7 +644,7 @@ async def _install_plugin_with_optional_fix(
         report = await asyncio.to_thread(
             audit_plugin_bytes,
             content,
-            filename=current.filename,
+            filename=install_filename,
             clamav_session=clamav_session,
         )
         if report.blocked:
@@ -638,7 +656,12 @@ async def _install_plugin_with_optional_fix(
                 audit=report,
             )
         result = _write_engine(
-            dest, content, current, engines_dir=engines_dir, fix=None
+            dest,
+            content,
+            current,
+            engines_dir=engines_dir,
+            fix=None,
+            install_filename=install_filename,
         )
         return InstallResult(
             plugin=current,

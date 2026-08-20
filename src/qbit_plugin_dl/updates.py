@@ -22,8 +22,12 @@ from qbit_plugin_dl.provenance import (
     content_sha256,
     load_installed_provenance,
 )
+from qbit_plugin_dl.url_recover import is_http_not_found, recover_github_raw_url
 
 UPDATE_INDICATOR = "⬆ "
+
+# Reuse catalog TTL so update markers do not rely on forever-stale content hashes.
+CATEGORY_SHA_TTL_SECONDS = 6 * 60 * 60
 
 
 def preferred_plugins_by_filename(
@@ -83,6 +87,7 @@ def remote_sha_from_cache(
     categories_cache: Mapping[str, dict] | None = None,
     *,
     prefer_full: bool = False,
+    max_age_seconds: float | None = None,
 ) -> str | None:
     cache = (
         categories_cache
@@ -92,6 +97,12 @@ def remote_sha_from_cache(
     entry = cache.get(download_url)
     if not isinstance(entry, dict):
         return None
+    if max_age_seconds is not None:
+        fetched_at = entry.get("fetched_at")
+        if not isinstance(fetched_at, (int, float)):
+            return None
+        if time.time() - float(fetched_at) > max_age_seconds:
+            return None
     if prefer_full:
         full = entry.get("sha256")
         # Never fall back to truncated sha when a full hash is required — mixing
@@ -111,6 +122,7 @@ def fetch_remote_sha(
     categories_cache_path: Path | None = None,
     trusted_hosts: Collection[str] | None = None,
     prefer_full: bool = False,
+    basename: str | None = None,
 ) -> str | None:
     """HTTPS GET plugin body, hash it, and optionally refresh categories cache sha."""
     result = fetch_plugin_bytes(
@@ -119,6 +131,22 @@ def fetch_remote_sha(
         max_bytes=MAX_PLUGIN_BYTES,
         trusted_hosts=trusted_hosts,
     )
+    url_used = download_url
+    if isinstance(result, FetchError) and is_http_not_found(result):
+        recovered = recover_github_raw_url(
+            client,
+            download_url,
+            basename=basename,
+        )
+        if recovered:
+            result = fetch_plugin_bytes(
+                client,
+                recovered,
+                max_bytes=MAX_PLUGIN_BYTES,
+                trusted_hosts=trusted_hosts,
+            )
+            if not isinstance(result, FetchError):
+                url_used = recovered
     if isinstance(result, FetchError):
         return None
     content = result.content
@@ -126,11 +154,13 @@ def fetch_remote_sha(
     full = content_sha256(content)
 
     if categories_cache is not None:
-        entry = dict(categories_cache.get(download_url) or {})
-        entry["sha"] = truncated
-        entry["sha256"] = full
-        entry.setdefault("fetched_at", time.time())
-        categories_cache[download_url] = entry
+        now = time.time()
+        for key in {download_url, url_used}:
+            entry = dict(categories_cache.get(key) or {})
+            entry["sha"] = truncated
+            entry["sha256"] = full
+            entry["fetched_at"] = now
+            categories_cache[key] = entry
         save_categories_cache(categories_cache, categories_cache_path)
     return full if prefer_full else truncated
 
@@ -236,7 +266,10 @@ def find_outdated_filenames(
                     remote = remote[:16]
             if remote is None:
                 remote = remote_sha_from_cache(
-                    url, cat_cache, prefer_full=prefer_full
+                    url,
+                    cat_cache,
+                    prefer_full=prefer_full,
+                    max_age_seconds=CATEGORY_SHA_TTL_SECONDS,
                 )
             if (
                 remote is None
@@ -246,7 +279,10 @@ def find_outdated_filenames(
                 # Truncated cache entry that still matches the install baseline
                 # prefix is enough to rule out an update without a live fetch.
                 trunc = remote_sha_from_cache(
-                    url, cat_cache, prefer_full=False
+                    url,
+                    cat_cache,
+                    prefer_full=False,
+                    max_age_seconds=CATEGORY_SHA_TTL_SECONDS,
                 )
                 if (
                     isinstance(trunc, str)
@@ -261,6 +297,7 @@ def find_outdated_filenames(
                     categories_cache=cat_cache,
                     trusted_hosts=trusted_hosts,
                     prefer_full=prefer_full,
+                    basename=filename,
                 )
                 if remote is not None:
                     remote_map[url] = remote

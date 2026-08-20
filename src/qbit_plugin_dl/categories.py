@@ -22,6 +22,7 @@ from qbit_plugin_dl.fetch import (
 )
 from qbit_plugin_dl.paths import atomic_write_text, cache_dir
 from qbit_plugin_dl.provenance import content_sha, content_sha256
+from qbit_plugin_dl.url_recover import is_http_not_found, recover_github_raw_url_async
 
 QBIT_CATEGORIES = (
     "anime",
@@ -271,6 +272,19 @@ async def _enrich_one(
             max_bytes=MAX_PLUGIN_BYTES,
             trusted_hosts=trusted_hosts,
         )
+        if isinstance(result, FetchError) and is_http_not_found(result):
+            recovered = await recover_github_raw_url_async(
+                client,
+                plugin.download_url,
+                basename=plugin.filename,
+            )
+            if recovered:
+                result = await fetch_plugin_bytes_async(
+                    client,
+                    recovered,
+                    max_bytes=MAX_PLUGIN_BYTES,
+                    trusted_hosts=trusted_hosts,
+                )
         if isinstance(result, FetchError):
             source = None
             content_bytes = None

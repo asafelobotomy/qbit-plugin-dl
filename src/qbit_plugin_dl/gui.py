@@ -41,6 +41,7 @@ from qbit_plugin_dl.audit_clamav import (
     format_clamav_backend_label,
 )
 from qbit_plugin_dl.catalog import (
+    CACHE_TTL_SECONDS,
     Plugin,
     Visibility,
     fetch_catalog,
@@ -190,6 +191,15 @@ _IMPORT_REASON_LABELS: dict[str, str] = {
     "subprocess": "Uses subprocess",
     "pickle": "Uses pickle",
     "marshal": "Uses marshal",
+    "requests": (
+        "Uses requests (not shipped by qBittorrent — needs urllib / helpers)"
+    ),
+    "httpx": (
+        "Uses httpx (not shipped by qBittorrent — needs urllib / helpers)"
+    ),
+    "aiohttp": (
+        "Uses aiohttp (not shipped by qBittorrent — needs urllib / helpers)"
+    ),
 }
 
 
@@ -297,7 +307,10 @@ def _still_blocked_reason(result: InstallResult) -> str:
         fails = report.fail_findings
         roots = _import_roots_from_findings(fails)
         if roots:
-            return f"still blocked: {', '.join(roots[:3])}"
+            labels = [
+                _IMPORT_REASON_LABELS.get(root, root) for root in roots[:2]
+            ]
+            return f"still blocked: {'; '.join(labels)}"
         if fails:
             return f"still blocked: {fails[0].code}"
     if result.error:
@@ -464,9 +477,21 @@ def format_install_summary(
         lines.append(
             f"Blocked by safety check ({len(safety_blocked)}) — not installed"
         )
-        lines.append(
-            "These engines use APIs that qBittorrent search plugins should not need."
-        )
+        http_client_roots = {"requests", "httpx", "aiohttp"}
+        blocked_roots: set[str] = set()
+        for result in safety_blocked:
+            report = result.audit
+            if report is not None:
+                blocked_roots.update(_import_roots_from_findings(report.fail_findings))
+        if blocked_roots & http_client_roots:
+            lines.append(
+                "Third-party HTTP libraries (requests/httpx/aiohttp) are not "
+                "available inside qBittorrent — engines must use urllib / helpers."
+            )
+        else:
+            lines.append(
+                "These engines use APIs that qBittorrent search plugins should not need."
+            )
         grouped: dict[str, list[str]] = defaultdict(list)
         labels: dict[str, str] = {}
         for result in safety_blocked:
@@ -652,6 +677,16 @@ def hide_discouraged_enabled() -> bool:
 def set_hide_discouraged_enabled(enabled: bool) -> None:
     settings = _settings()
     settings.setValue("ui/hide_discouraged", enabled)
+    settings.sync()
+
+
+def auto_refresh_enabled() -> bool:
+    return bool(_settings().value("updates/auto_refresh_enabled", True, type=bool))
+
+
+def set_auto_refresh_enabled(enabled: bool) -> None:
+    settings = _settings()
+    settings.setValue("updates/auto_refresh_enabled", enabled)
     settings.sync()
 
 
@@ -1191,7 +1226,30 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.progress)
 
-        QTimer.singleShot(0, lambda: self.refresh_catalog(force_refresh=False))
+        # Always fetch a fresh catalog on launch so Version/Updated and ⬆ markers
+        # reflect current allowlisted sources (Update all stays confirm-gated).
+        QTimer.singleShot(0, lambda: self.refresh_catalog(force_refresh=True))
+        self._catalog_refresh_timer = QTimer(self)
+        self._catalog_refresh_timer.setInterval(CACHE_TTL_SECONDS * 1000)
+        self._catalog_refresh_timer.timeout.connect(self._on_auto_catalog_refresh)
+        if auto_refresh_enabled():
+            self._catalog_refresh_timer.start()
+
+    def _workers_busy(self) -> bool:
+        return bool(
+            (self._catalog_worker and self._catalog_worker.isRunning())
+            or (self._category_worker and self._category_worker.isRunning())
+            or (self._install_worker and self._install_worker.isRunning())
+            or (self._uninstall_worker and self._uninstall_worker.isRunning())
+            or (self._update_worker and self._update_worker.isRunning())
+        )
+
+    def _on_auto_catalog_refresh(self) -> None:
+        if not auto_refresh_enabled():
+            return
+        if self._workers_busy():
+            return
+        self.refresh_catalog(force_refresh=True)
 
     def _build_menu(self) -> None:
         menu_bar = QMenuBar(self)
@@ -1220,7 +1278,7 @@ class MainWindow(QMainWindow):
                 "rewrites require a <b>clean</b> ClamAV result unless "
                 "<b>Allow AST without ClamAV</b> is enabled. Infected content "
                 "is never fixed; after any rewrite ClamAV runs again when "
-                "available. Downloads stream with a size cap; "
+                "available. Downloads stream with a size cap (10 MB); "
                 "<code>raw.githubusercontent.com</code> / gist hosts are "
                 "auto-trusted, other HTTPS hosts need confirmation. Fixed "
                 "engines show 🔧 in the list. "

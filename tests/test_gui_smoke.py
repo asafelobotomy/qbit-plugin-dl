@@ -592,6 +592,9 @@ def test_version_column_shows_placeholder_when_empty(tmp_path: Path, monkeypatch
     assert item.text(COL_VERSION) == "2.1"
     window.close()
     assert app is not None
+
+
+def test_name_column_fix_and_update_indicators(tmp_path: Path, monkeypatch):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
@@ -663,7 +666,7 @@ def test_format_install_summary_failed_fix_attempts(tmp_path: Path):
     assert "Fix attempts that did not install" in msg
     assert "Broken" in msg
     assert "py2_imports" in msg
-    assert "still blocked: requests" in msg
+    assert "still blocked: Uses requests" in msg
 
 
 def test_format_install_summary_collapses_common_warnings(tmp_path: Path):
@@ -716,17 +719,41 @@ def test_format_install_summary_collapses_common_warnings(tmp_path: Path):
     assert "A — IMPORT_PY2_SHIM" not in msg
 
 
+def test_format_install_summary_requests_messaging(tmp_path: Path):
+    results = [
+        InstallResult(
+            plugin=_plugin(name="mikanani", download_url="https://example.com/mikanani.py"),
+            ok=False,
+            path=None,
+            error="Safety check blocked install",
+            audit=AuditReport(
+                findings=(
+                    AuditFinding(
+                        code="IMPORT_DENY",
+                        severity="fail",
+                        message="Denied import 'requests' at line 28",
+                    ),
+                )
+            ),
+        )
+    ]
+    _, msg, _ = format_install_summary(results, tmp_path)
+    assert "Uses requests" in msg
+    assert "not available inside qBittorrent" in msg
+    assert "urllib" in msg
+
+
 def test_format_install_summary_file_too_large(tmp_path: Path):
     results = [
         InstallResult(
             plugin=_plugin(name="Huge"),
             ok=False,
             path=None,
-            error="Response too large (27037504 bytes > 2097152 bytes limit)",
+            error="Response too large (27037504 bytes > 10485760 bytes limit)",
         )
     ]
     _, msg, _ = format_install_summary(results, tmp_path)
-    assert "File too large (25.8 MB > 2.0 MB limit)" in msg
+    assert "File too large (25.8 MB > 10.0 MB limit)" in msg
 
 
 def test_format_install_summary_provenance_error(tmp_path: Path):

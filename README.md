@@ -52,14 +52,15 @@ On first launch you must **Accept** the safety notice (persisted via Qt settings
 ## Threat model
 
 - Catalog entries come from allowlisted HTTPS sources only (MediaWiki list + GitHub Contents API for known repos). Download URLs use `raw.githubusercontent.com` or the wiki’s listed HTTPS links.
-- Downloads are **streamed** with a hard size abort, redirect cap, and **HTTPS-only** final URLs. Hosts `raw.githubusercontent.com` and `gist.githubusercontent.com` are auto-trusted; other HTTPS hosts need a one-time or “Always trust” confirmation (asked before install, category resolve, and update checks). Loopback / private / link-local / cloud-metadata addresses are rejected (DNS rebinding is not fully eliminated).
+- Downloads are **streamed** with a hard size abort (**10 MB**), redirect cap, and **HTTPS-only** final URLs. Hosts `raw.githubusercontent.com` and `gist.githubusercontent.com` are auto-trusted; other HTTPS hosts need a one-time or “Always trust” confirmation (asked before install, category resolve, and update checks). Loopback / private / link-local / cloud-metadata addresses are rejected (DNS rebinding is not fully eliminated).
+- Stale GitHub raw paths (common when wiki rows lag behind repo moves) are recovered via the GitHub git trees API (same repo/ref, matching basename, including `deprecated/` renames) before install/update checks give up.
 - This app validates basenames, runs the static safety check (and optional ClamAV — toggleable in the toolbar), and writes engines under the chosen `nova3/engines` directory with restrictive temp modes and atomic sidecar writes. It does **not** execute plugins.
-- The static check allows in-process threads (needed for Jackett and many engines) and blocks process spawning plus other high-risk APIs (`exec`, `subprocess`, `ctypes`, …). It is not a runtime sandbox.
+- The static check allows in-process threads (needed for Jackett and many engines) and blocks process spawning plus other high-risk APIs (`exec`, `subprocess`, `ctypes`, …) and third-party HTTP clients (`requests` / `httpx` / `aiohttp`) that qBittorrent does not ship. It is not a runtime sandbox.
 - Optional safe fixes (off by default): AST rewrites need ClamAV **clean** unless **Allow AST without ClamAV** is on; alternates may still run when ClamAV did not scan. Infected content is never “fixed” into place.
 - Provenance stores a full SHA-256 of installed bytes (plus a short `sha` for older caches). Update checks prefer the full hash when present.
 - **qBittorrent** loads and runs installed engines later.
 - Category resolution parses `supported_categories` with `ast.literal_eval` only (never `exec` / `import` of plugin modules).
-- SHA hashes in the category cache identify source content for cache freshness — they are not a trust or integrity guarantee against malicious plugins.
+- SHA hashes in the category cache identify source content for cache freshness (6-hour TTL for update markers) — they are not a trust or integrity guarantee against malicious plugins.
 - Static review + optional ClamAV + disclaimer + discouraged filters reduce risk but do not eliminate it. The app never starts `clamd` or elevates privileges for scanning.
 
 ## Quick start
@@ -71,9 +72,35 @@ chmod +x qbit-plugin-dl-x86_64.AppImage
 ./qbit-plugin-dl-x86_64.AppImage
 ```
 
+Release AppImages **bundle** `libxcb-cursor` (needed by Qt 6.5+ on X11). If an older build fails with `libxcb-cursor.so.0: cannot open shared object file` or `no Qt platform plugin could be initialized`, either download a newer release or install the host package:
+
+```bash
+# Debian / Ubuntu
+sudo apt install libxcb-cursor0
+
+# Fedora
+sudo dnf install libxcb-cursor
+
+# Arch
+sudo pacman -S libxcb
+```
+
+If the AppImage will not mount (missing FUSE), run:
+
+```bash
+APPIMAGE_EXTRACT_AND_RUN=1 ./qbit-plugin-dl-x86_64.AppImage
+# or: ./qbit-plugin-dl-x86_64.AppImage --appimage-extract-and-run
+```
+
+You still need a normal desktop display (X11 or Wayland). Headless/SSH sessions without `DISPLAY` cannot open the GUI.
+
+#### What is libxcb-cursor?
+
+**XCB** (X C Binding) is the modern C API for talking to an X11 display server. **libxcb-cursor** is a small helper library on top of XCB that loads mouse-cursor images (theme cursors, pointer shapes). Qt’s `xcb` platform plugin links it so the window can show a normal pointer and honor the desktop cursor theme. It is not antivirus software, not part of qBittorrent, and not related to torrent “trackers” — only GUI cursor support under X11. Wayland sessions use a different stack; this dependency matters when Qt selects the `xcb` plugin (typical on X11, and sometimes under XWayland).
+
 ### From source
 
-Requires **Python 3.11+**, Linux, and network access to GitHub.
+Requires **Python 3.11+**, Linux, network access to GitHub, and the same GUI stack as above (including `libxcb-cursor0` / equivalent when using X11).
 
 ```bash
 python3 -m venv .venv
@@ -83,11 +110,10 @@ qbit-plugin-dl
 # or: python -m qbit_plugin_dl
 qbit-plugin-dl --version
 ```
-
 ## Usage
 
 1. Accept the safety notice on first launch (Decline exits).
-2. Wait for the catalog to load (or click **Refresh catalog**). Categories resolve in the background from each plugin’s `.py`. After that, installed engines are checked for updates; an upwards-arrow marker on the **Name** means the local file differs from the catalog copy.
+2. On launch the catalog is force-refreshed (and again every 6 hours while the window stays open) so Version / Updated columns and update markers stay current. You can still click **Refresh catalog** anytime. Categories resolve in the background from each plugin’s `.py`. After that, installed engines are checked for updates; an upwards-arrow marker on the **Name** means the local file differs from the catalog copy. **Update all** remains confirm-gated — nothing is reinstalled automatically.
 3. Filter by name, public/private, **category**, and optionally hide discouraged plugins.
 4. Check the plugins you want. When a **with categories** twin or another **author fork** installs to the same `.py` filename, the preferred engine is the main row (newest non-discouraged fork, then version / categories / qBittorrent 5 hint). Expand the row to pick an alternate instead — only one of the group can be selected.
 5. Confirm the install path (labeled Flatpak / Native / Legacy when recognized).
@@ -112,18 +138,19 @@ The app prefers the first existing path, otherwise creates the modern native pat
 
 ## Build AppImage
 
-Icon refresh requires **ImageMagick** (`magick`) or Pillow:
+Icon refresh requires **ImageMagick** (`magick`) or Pillow. The build also needs `libxcb-cursor.so.0` on the builder (or Debian/Ubuntu `apt-get download` access) so it can embed the library into the AppImage:
 
 ```bash
+# Debian / Ubuntu builders
+sudo apt install libxcb-cursor0
 chmod +x scripts/sync-icons.sh scripts/build-appimage.sh
 ./scripts/sync-icons.sh   # branding → resources + AppImage PNG
 ./scripts/build-appimage.sh
 ```
 
-Builds a wheel, syncs icons, generates `appimage/requirements.txt`, and runs [`python-appimage`](https://github.com/niess/python-appimage). Override the bundled Python with `PYTHON_VERSION=3.12` (default).
+Builds a wheel, syncs icons, generates `appimage/requirements.txt`, runs [`python-appimage`](https://github.com/niess/python-appimage), then injects `libxcb-cursor` into `PySide6/Qt/lib` and repacks. Override the bundled Python with `PYTHON_VERSION=3.12` (default).
 
 `APPIMAGE_EXTRACT_AND_RUN=1` is set so `appimagetool` works without FUSE. The result is `qbit-plugin-dl-x86_64.AppImage` (~200+ MB because of Qt).
-
 ## Tests
 
 ```bash

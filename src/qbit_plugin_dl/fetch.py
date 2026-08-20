@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 import httpx
 
 # Keep in sync with install / categories / updates callers.
-MAX_PLUGIN_BYTES = 2 * 1024 * 1024
+MAX_PLUGIN_BYTES = 10 * 1024 * 1024
 MAX_REDIRECTS = 5
 
 # Final download hosts that do not need user consent.
@@ -36,7 +36,7 @@ class FetchError:
     """Failed download with a stable reason code for callers/UI."""
 
     message: str
-    code: str  # https | size | empty | host | private | network | redirect
+    code: str  # https | size | empty | host | private | network | redirect | not_found
     host: str = ""
 
 
@@ -267,7 +267,9 @@ async def fetch_plugin_bytes_async(
                 chunks.append(chunk)
             content = b"".join(chunks)
     except httpx.HTTPStatusError as exc:
-        return FetchError(message=str(exc), code="network")
+        status = exc.response.status_code if exc.response is not None else 0
+        code = "not_found" if status == 404 else "network"
+        return FetchError(message=str(exc), code=code)
     except Exception as exc:  # noqa: BLE001
         return FetchError(message=str(exc), code="network")
 
@@ -374,7 +376,9 @@ def fetch_plugin_bytes(
                 chunks.append(chunk)
             content = b"".join(chunks)
     except httpx.HTTPStatusError as exc:
-        return FetchError(message=str(exc), code="network")
+        status = exc.response.status_code if exc.response is not None else 0
+        code = "not_found" if status == 404 else "network"
+        return FetchError(message=str(exc), code=code)
     except Exception as exc:  # noqa: BLE001
         return FetchError(message=str(exc), code="network")
 
