@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -105,9 +105,10 @@ jobs:
 
       - name: Set up Python
         if: steps.version.outputs.should_release == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install system dependencies
         if: steps.version.outputs.should_release == 'true'
@@ -122,11 +123,13 @@ jobs:
 
       - name: Install package and run tests
         if: steps.version.outputs.should_release == 'true'
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-          pytest -q
+          python -m pytest -q
 
       - name: Build AppImage
         if: steps.version.outputs.should_release == 'true'
