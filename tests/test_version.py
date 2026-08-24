@@ -1,4 +1,4 @@
-"""Keep package version aligned with pyproject.toml."""
+"""Keep package version aligned across release metadata."""
 
 from pathlib import Path
 
@@ -11,5 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_version_matches_pyproject():
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert data["project"]["version"] == "0.1.4"
     assert __version__ == data["project"]["version"]
+
+
+def test_appstream_lists_current_version():
+    text = (ROOT / "appimage" / "qbit-plugin-dl.appdata.xml").read_text(
+        encoding="utf-8"
+    )
+    assert f'version="{__version__}"' in text
