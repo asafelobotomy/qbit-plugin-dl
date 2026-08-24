@@ -59,7 +59,7 @@ from qbit_plugin_dl.categories import (
     format_categories,
 )
 from qbit_plugin_dl.fetch import (
-    hostname_from_url,
+    trust_key_for_url,
     untrusted_hosts_in_urls,
 )
 from qbit_plugin_dl.fix import FIX_INDICATOR, alternates_from_catalog
@@ -732,7 +732,10 @@ def set_allow_ast_without_clamav_enabled(enabled: bool) -> None:
 
 
 def trusted_download_hosts() -> set[str]:
-    """Persisted hosts the user chose to always trust for downloads."""
+    """Persisted trust keys the user chose to always trust for downloads.
+
+    Keys are hostnames (``codeberg.org``) or GitHub repos (``github:owner/repo``).
+    """
     raw = _settings().value("security/trusted_download_hosts", [], type=list)
     if not isinstance(raw, list):
         return set()
@@ -740,6 +743,7 @@ def trusted_download_hosts() -> set[str]:
 
 
 def add_trusted_download_host(host: str) -> None:
+    """Persist a trust key (hostname or ``github:owner/repo``)."""
     host = host.lower().strip()
     if not host:
         return
@@ -1279,9 +1283,11 @@ class MainWindow(QMainWindow):
                 "<b>Allow AST without ClamAV</b> is enabled. Infected content "
                 "is never fixed; after any rewrite ClamAV runs again when "
                 "available. Downloads stream with a size cap (10 MB); "
-                "<code>raw.githubusercontent.com</code> / gist hosts are "
-                "auto-trusted, other HTTPS hosts need confirmation. Fixed "
-                "engines show 🔧 in the list. "
+                "allowlisted catalog GitHub repos "
+                "(<code>qbittorrent/search-plugins</code>, "
+                "<code>LightDestory/qBittorrent-Search-Plugins</code>) are "
+                "auto-trusted; other repos and HTTPS hosts need confirmation. "
+                "Fixed engines show 🔧 in the list. "
                 "This is a review aid, not a sandbox or guarantee of safety.<br><br>"
                 "Plugins are community Python scripts — use them at your own risk."
             ),
@@ -1372,10 +1378,12 @@ class MainWindow(QMainWindow):
         required: bool = True,
     ) -> bool:
         """
-        Pre-prompt for non-allowlisted hosts on catalog URLs.
+        Pre-prompt for non-allowlisted trust keys on catalog URLs.
 
-        When *required* is True (install), Cancel aborts. When False
-        (categories / updates), Cancel continues without trusting new hosts.
+        Trust keys are ``github:owner/repo`` for GitHub raw URLs, or a hostname
+        for other HTTPS downloads. When *required* is True (install), Cancel
+        aborts. When False (categories / updates), Cancel continues without
+        trusting new keys.
         """
         unknown = untrusted_hosts_in_urls(
             (p.download_url for p in plugins),
@@ -1386,21 +1394,27 @@ class MainWindow(QMainWindow):
             return True
 
         examples: list[str] = []
-        for host in unknown:
+        for key in unknown:
+            label = (
+                key.removeprefix("github:")
+                if key.startswith("github:")
+                else key
+            )
             for plugin in plugins:
-                if hostname_from_url(plugin.download_url) == host:
-                    examples.append(f"{host}\n  e.g. {plugin.download_url}")
+                if trust_key_for_url(plugin.download_url) == key:
+                    examples.append(f"{label}\n  e.g. {plugin.download_url}")
                     break
             else:
-                examples.append(host)
+                examples.append(label)
 
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Untrusted download hosts")
+        box.setWindowTitle("Untrusted download sources")
         box.setText(
-            "Some plugins download from hosts that are not on the "
-            "built-in allowlist (raw.githubusercontent.com / "
-            "gist.githubusercontent.com)."
+            "Some plugins download from sources that are not on the "
+            "built-in allowlist (qbittorrent/search-plugins and "
+            "LightDestory/qBittorrent-Search-Plugins on "
+            "raw.githubusercontent.com)."
         )
         box.setInformativeText(
             f"Approve to continue this {purpose}:\n\n" + "\n\n".join(examples)
@@ -1414,8 +1428,8 @@ class MainWindow(QMainWindow):
             self._session_trusted_hosts.update(unknown)
             return True
         if clicked is always_btn:
-            for host in unknown:
-                add_trusted_download_host(host)
+            for key in unknown:
+                add_trusted_download_host(key)
             return True
         self._declined_download_hosts.update(unknown)
         return not required

@@ -17,7 +17,7 @@ from qbit_plugin_dl.fetch import (
     MAX_PLUGIN_BYTES,
     MAX_REDIRECTS,
     FetchError,
-    fetch_plugin_bytes_async,
+    fetch_with_github_recovery_async,
     require_https_url,
 )
 from qbit_plugin_dl.fix import (
@@ -33,10 +33,6 @@ from qbit_plugin_dl.provenance import (
     content_sha256,
     record_install_provenance,
     remove_install_provenance,
-)
-from qbit_plugin_dl.url_recover import (
-    is_http_not_found,
-    recover_github_raw_url_async,
 )
 
 
@@ -391,9 +387,10 @@ async def _fetch_plugin_bytes(
     trusted_hosts: Collection[str] | None = None,
 ) -> tuple[bytes | None, str | None, FetchError | None]:
     """Return (content, error_message, fetch_error)."""
-    result = await fetch_plugin_bytes_async(
+    result = await fetch_with_github_recovery_async(
         client,
         plugin.download_url,
+        basename=plugin.filename,
         max_bytes=MAX_PLUGIN_BYTES,
         trusted_hosts=trusted_hosts,
     )
@@ -504,20 +501,10 @@ async def _install_plugin_with_optional_fix(
                 error=str(exc),
             )
 
-        content, fetch_error, fetch_err_obj = await _fetch_plugin_bytes(
+        content, fetch_error, _fetch_err = await _fetch_plugin_bytes(
             client, current, trusted_hosts=trusted_hosts
         )
         if content is None:
-            # Stale wiki raw path — recover moved/renamed blob in the same repo.
-            if is_http_not_found(fetch_err_obj or fetch_error):
-                recovered = await recover_github_raw_url_async(
-                    client,
-                    current.download_url,
-                    basename=install_filename,
-                )
-                if recovered and recovered not in tried_urls:
-                    current = replace(current, download_url=recovered)
-                    continue
             # Network / size / host failure — try alternate if auto_fix.
             if auto_fix:
                 nxt = ranked_alternates(

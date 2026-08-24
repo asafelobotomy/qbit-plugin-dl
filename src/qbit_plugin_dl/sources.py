@@ -212,7 +212,10 @@ class GitHubEnginesProvider:
 
 
 def default_providers() -> list[CatalogProvider]:
-    """Hard-coded v1 allowlist of enabled catalog providers."""
+    """Hard-coded v1 allowlist of enabled catalog providers.
+
+    Download auto-trust for these repos lives in ``fetch.ALLOWED_GITHUB_REPOS``.
+    """
     return [
         WikiCatalogProvider(),
         GitHubEnginesProvider(

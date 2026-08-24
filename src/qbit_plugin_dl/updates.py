@@ -14,7 +14,7 @@ from qbit_plugin_dl.fetch import (
     MAX_PLUGIN_BYTES,
     MAX_REDIRECTS,
     FetchError,
-    fetch_plugin_bytes,
+    fetch_with_github_recovery,
 )
 from qbit_plugin_dl.install import list_installed_filenames
 from qbit_plugin_dl.provenance import (
@@ -22,7 +22,6 @@ from qbit_plugin_dl.provenance import (
     content_sha256,
     load_installed_provenance,
 )
-from qbit_plugin_dl.url_recover import is_http_not_found, recover_github_raw_url
 
 UPDATE_INDICATOR = "⬆ "
 
@@ -125,30 +124,16 @@ def fetch_remote_sha(
     basename: str | None = None,
 ) -> str | None:
     """HTTPS GET plugin body, hash it, and optionally refresh categories cache sha."""
-    result = fetch_plugin_bytes(
+    result = fetch_with_github_recovery(
         client,
         download_url,
+        basename=basename,
         max_bytes=MAX_PLUGIN_BYTES,
         trusted_hosts=trusted_hosts,
     )
-    url_used = download_url
-    if isinstance(result, FetchError) and is_http_not_found(result):
-        recovered = recover_github_raw_url(
-            client,
-            download_url,
-            basename=basename,
-        )
-        if recovered:
-            result = fetch_plugin_bytes(
-                client,
-                recovered,
-                max_bytes=MAX_PLUGIN_BYTES,
-                trusted_hosts=trusted_hosts,
-            )
-            if not isinstance(result, FetchError):
-                url_used = recovered
     if isinstance(result, FetchError):
         return None
+    url_used = result.final_url
     content = result.content
     truncated = content_sha(content)
     full = content_sha256(content)

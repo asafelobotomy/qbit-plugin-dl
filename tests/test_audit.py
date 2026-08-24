@@ -256,3 +256,42 @@ def test_jackett_style_concurrency_header_allowed():
     )
     report = audit_plugin_static(src.encode(), filename="demo.py")
     assert not report.blocked
+
+
+def test_getattr_os_system_blocked():
+    src = engine_source(
+        extra_imports="import os\n",
+        body=(
+            'getattr(os, "system")("id")\n'
+            "        prettyPrinter({'name': what})"
+        ),
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert report.blocked
+    assert any(f.code == "DYN_ATTR" for f in report.fail_findings)
+
+
+def test_os_dict_system_blocked():
+    src = engine_source(
+        extra_imports="import os\n",
+        body=(
+            'os.__dict__["system"]("id")\n'
+            "        prettyPrinter({'name': what})"
+        ),
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert report.blocked
+    assert any(f.code == "DYN_ATTR" for f in report.fail_findings)
+
+
+def test_operator_attrgetter_system_blocked():
+    src = engine_source(
+        extra_imports="import operator\nimport os\n",
+        body=(
+            'operator.attrgetter("system")(os)("id")\n'
+            "        prettyPrinter({'name': what})"
+        ),
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert report.blocked
+    assert any(f.code == "DYN_ATTR" for f in report.fail_findings)

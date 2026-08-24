@@ -206,6 +206,34 @@ _DECODE_FUNCS: frozenset[str] = frozenset(
     }
 )
 
+# Attr names that must not be resolved dynamically (getattr / __dict__ / …).
+_DANGEROUS_ATTR_NAMES: frozenset[str] = frozenset(
+    {
+        *_OS_DANGEROUS_ATTRS,
+        *_DANGEROUS_BUILTINS,
+        "Process",
+        "Pool",
+        "ProcessPoolExecutor",
+        "system",
+        "popen",
+        "Popen",
+        "call",
+        "run",
+        "check_output",
+        "check_call",
+        "getoutput",
+        "getstatusoutput",
+        "loads",
+        "load",
+        "dumps",
+        "dump",
+    }
+)
+
+_DYN_ATTR_FUNCS: frozenset[str] = frozenset(
+    {"getattr", "setattr", "delattr", "vars", "getattr_static"}
+)
+
 _HIGH_ENTROPY_MIN_LEN = 80
 _HIGH_ENTROPY_THRESHOLD = 4.5
 _EXTREME_LINE_LEN = 500
@@ -530,6 +558,77 @@ class _PolicyVisitor(ast.NodeVisitor):
         self._check_call(node)
         self.generic_visit(node)
 
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        self._check_dangerous_subscript(node)
+        self.generic_visit(node)
+
+    def _constant_str(self, node: ast.AST | None) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return None
+
+    def _check_dangerous_attr_name(self, name: str, lineno: int, *, via: str) -> None:
+        if name not in _DANGEROUS_ATTR_NAMES:
+            return
+        self.findings.append(
+            _finding(
+                "DYN_ATTR",
+                SEVERITY_FAIL,
+                f"Dynamic access to dangerous attribute {name!r} via {via} "
+                f"at line {lineno}",
+            )
+        )
+
+    def _check_dangerous_subscript(self, node: ast.Subscript) -> None:
+        chain = _attr_chain(node.value)
+        if not chain:
+            return
+        if chain[-1] not in {"__dict__", "__builtins__", "__globals__", "__class__"}:
+            return
+        slice_node = node.slice
+        name = self._constant_str(slice_node)
+        if name is None:
+            return
+        self._check_dangerous_attr_name(
+            name,
+            node.lineno,
+            via=".".join(chain),
+        )
+
+    def _check_dyn_attr_call(self, node: ast.Call) -> bool:
+        """Block getattr/setattr/… and operator.attrgetter of dangerous names."""
+        func = node.func
+        lineno = node.lineno
+
+        if isinstance(func, ast.Name) and func.id in _DYN_ATTR_FUNCS:
+            # getattr(obj, "system") — name is 2nd arg; vars(obj) alone is warn-free.
+            if func.id in {"getattr", "setattr", "delattr"} and len(node.args) >= 2:
+                name = self._constant_str(node.args[1])
+                if name is not None:
+                    self._check_dangerous_attr_name(name, lineno, via=func.id)
+                    return True
+            return False
+
+        chain = _attr_chain(func)
+        if not chain:
+            return False
+        if chain[0] == "operator" and chain[-1] in {"attrgetter", "methodcaller"}:
+            if node.args:
+                name = self._constant_str(node.args[0])
+                if name is not None:
+                    self._check_dangerous_attr_name(
+                        name, lineno, via=".".join(chain)
+                    )
+                    return True
+        if chain[-1] in _DYN_ATTR_FUNCS and len(node.args) >= 2:
+            name = self._constant_str(node.args[1])
+            if name is not None:
+                self._check_dangerous_attr_name(
+                    name, lineno, via=".".join(chain)
+                )
+                return True
+        return False
+
     def _check_call(self, node: ast.Call) -> None:
         func = node.func
         if isinstance(func, ast.Name) and func.id in _DANGEROUS_BUILTINS:
@@ -542,6 +641,9 @@ class _PolicyVisitor(ast.NodeVisitor):
                 )
             )
             self._check_decode_exec_args(node)
+            return
+
+        if self._check_dyn_attr_call(node):
             return
 
         if isinstance(func, ast.Name) and func.id == "ProcessPoolExecutor":

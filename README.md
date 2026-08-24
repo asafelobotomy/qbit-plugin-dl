@@ -41,7 +41,7 @@ Fetches allowlisted catalogs (unofficial MediaWiki list, official `nova3/engines
 
 Unofficial plugins are community Python scripts. **Use them at your own risk.** Prefer reviewing a script before installing.
 
-Before writing an engine, this app runs a **static safety check** (format/encoding, AST import and call policy, nova3 structure heuristics). It never `import`s or `exec`s plugin code. In-process **threads** (`threading`, `concurrent.futures.ThreadPoolExecutor`, `multiprocessing.dummy`) are allowed — official Jackett and many engines use them for parallel HTTP. **OS process spawning** (`multiprocessing.Process` / `Pool`, `ProcessPoolExecutor`) and other dangerous APIs stay blocked. Optional **Safe fixes during install** (off by default) may try same-filename catalog alternates and allowlisted AST rewrites (Py2→Py3, ProcessPool→ThreadPool). AST rewrites require a **clean** ClamAV result unless **Allow AST without ClamAV** is enabled (off by default). Infected content is never fixed. After any rewrite ClamAV is run again when available. Fixed installs show a 🔧 marker in the Name column. When **ClamAV** is installed on the host, the app prefers a running `clamd` via `clamdscan --fdpass` (warm signature DB; scans are serialized). If only one-shot `clamscan` is available, you are asked before each install (choice can be remembered) — `clamscan` reloads the DB and is heavy on RAM, so prefer `clamd` for bulk installs. AppImage/Flatpak sandboxes may not see the host daemon — then only the static check runs.
+Before writing an engine, this app runs a **static safety check** (format/encoding, AST import and call policy, nova3 structure heuristics). It never `import`s or `exec`s plugin code. In-process **threads** (`threading`, `concurrent.futures.ThreadPoolExecutor`, `multiprocessing.dummy`) are allowed — official Jackett and many engines use them for parallel HTTP. **OS process spawning** (`multiprocessing.Process` / `Pool`, `ProcessPoolExecutor`) and other high-risk patterns (direct `os.system` / `subprocess`, dynamic `getattr` / `__dict__` access to those APIs, …) are blocked by the review aid. It is not a runtime sandbox and cannot catch every obfuscation. Optional **Safe fixes during install** (off by default) may try same-filename catalog alternates and allowlisted AST rewrites (Py2→Py3, ProcessPool→ThreadPool). AST rewrites require a **clean** ClamAV result unless **Allow AST without ClamAV** is enabled (off by default). Infected content is never fixed. After any rewrite ClamAV is run again when available. Fixed installs show a 🔧 marker in the Name column. When **ClamAV** is installed on the host, the app prefers a running `clamd` via `clamdscan --fdpass` (warm signature DB; scans are serialized). If only one-shot `clamscan` is available, you are asked before each install (choice can be remembered) — `clamscan` reloads the DB and is heavy on RAM, so prefer `clamd` for bulk installs. AppImage/Flatpak sandboxes may not see the host daemon — then only the static check runs. ClamAV errors/timeouts soft-fail (install continues) unless the scan reports infected.
 
 This is a review aid, **not** a claim that plugins are malware-free or verified secure. It is not a sandbox.
 
@@ -52,10 +52,10 @@ On first launch you must **Accept** the safety notice (persisted via Qt settings
 ## Threat model
 
 - Catalog entries come from allowlisted HTTPS sources only (MediaWiki list + GitHub Contents API for known repos). Download URLs use `raw.githubusercontent.com` or the wiki’s listed HTTPS links.
-- Downloads are **streamed** with a hard size abort (**10 MB**), redirect cap, and **HTTPS-only** final URLs. Hosts `raw.githubusercontent.com` and `gist.githubusercontent.com` are auto-trusted; other HTTPS hosts need a one-time or “Always trust” confirmation (asked before install, category resolve, and update checks). Loopback / private / link-local / cloud-metadata addresses are rejected (DNS rebinding is not fully eliminated).
+- Downloads are **streamed** with a hard size abort (**10 MB**), redirect hop cap, and **HTTPS-only** URLs. Each redirect hop is checked before the request (host trust + private/link-local/metadata IP rejection). Auto-trust is **repo-scoped**: only `qbittorrent/search-plugins` and `LightDestory/qBittorrent-Search-Plugins` on `raw.githubusercontent.com`. Other GitHub repos and HTTPS hosts need a one-time or “Always trust” confirmation (asked before install, category resolve, and update checks). DNS rebinding is not fully eliminated.
 - Stale GitHub raw paths (common when wiki rows lag behind repo moves) are recovered via the GitHub git trees API (same repo/ref, matching basename, including `deprecated/` renames) before install/update checks give up.
 - This app validates basenames, runs the static safety check (and optional ClamAV — toggleable in the toolbar), and writes engines under the chosen `nova3/engines` directory with restrictive temp modes and atomic sidecar writes. It does **not** execute plugins.
-- The static check allows in-process threads (needed for Jackett and many engines) and blocks process spawning plus other high-risk APIs (`exec`, `subprocess`, `ctypes`, …) and third-party HTTP clients (`requests` / `httpx` / `aiohttp`) that qBittorrent does not ship. It is not a runtime sandbox.
+- The static check allows in-process threads (needed for Jackett and many engines) and blocks process spawning plus other high-risk APIs (`exec`, `subprocess`, `ctypes`, dynamic attribute indirection, …) and third-party HTTP clients (`requests` / `httpx` / `aiohttp`) that qBittorrent does not ship. It is not a runtime sandbox.
 - Optional safe fixes (off by default): AST rewrites need ClamAV **clean** unless **Allow AST without ClamAV** is on; alternates may still run when ClamAV did not scan. Infected content is never “fixed” into place.
 - Provenance stores a full SHA-256 of installed bytes (plus a short `sha` for older caches). Update checks prefer the full hash when present.
 - **qBittorrent** loads and runs installed engines later.
@@ -66,6 +66,16 @@ On first launch you must **Accept** the safety notice (persisted via Qt settings
 ## Quick start
 
 ### AppImage (recommended)
+
+1. Download the latest AppImage and checksums from
+   [Releases](https://github.com/asafelobotomy/qbit-plugin-dl/releases).
+2. Verify (optional but recommended):
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
+
+3. Make it executable and run:
 
 ```bash
 chmod +x qbit-plugin-dl-x86_64.AppImage
@@ -82,7 +92,7 @@ sudo apt install libxcb-cursor0
 sudo dnf install libxcb-cursor
 
 # Arch
-sudo pacman -S libxcb
+sudo pacman -S xcb-util-cursor
 ```
 
 If the AppImage will not mount (missing FUSE), run:
@@ -154,8 +164,10 @@ Builds a wheel, syncs icons, generates `appimage/requirements.txt`, runs [`pytho
 ## Tests
 
 ```bash
-pytest
+QT_QPA_PLATFORM=offscreen pytest
 ```
+
+GUI smoke tests need an offscreen Qt platform (CI sets this). Plain `pytest` often works via a test-side default, but matching CI is more reliable.
 
 ## Releases
 
@@ -174,6 +186,8 @@ v1 merges three allowlisted providers (best-effort; one failure does not block t
 | `lightdestory` | [`LightDestory/qBittorrent-Search-Plugins`](https://github.com/LightDestory/qBittorrent-Search-Plugins) | `src/engines/*.py` |
 
 GitHub providers use the public Contents API (≈60 unauthenticated requests/hour) and build HTTPS `raw.githubusercontent.com` download URLs only. `__init__.py` and `template.py` are skipped. Official `jackett.py` is included; it needs a **local Jackett** instance after install.
+
+Download auto-trust matches these two GitHub repos only. Wiki rows that point at other authors’ repositories require confirmation before install.
 
 Results are concatenated, then grouped with the same with-categories / author-fork scoring as before (same install filename → one row with alternates).
 

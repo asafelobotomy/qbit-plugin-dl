@@ -29,6 +29,10 @@ class FakeStreamResponse:
         self.history = history or []
         self._chunk_size = chunk_size
 
+    @property
+    def is_redirect(self) -> bool:
+        return self.status_code in {301, 302, 303, 307, 308}
+
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             request = httpx.Request("GET", str(self.url))
@@ -86,6 +90,40 @@ class AsyncMapClient:
 
     async def get(self, url: str) -> FakeStreamResponse:
         return self._response(url)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class AsyncRedirectClient:
+    """Async client with per-URL status/headers/body for redirect-chain tests."""
+
+    def __init__(
+        self,
+        mapping: dict[str, FakeStreamResponse | bytes | tuple[int, bytes]],
+    ) -> None:
+        self.mapping = mapping
+        self.gets: list[str] = []
+
+    def _response(self, url: str) -> FakeStreamResponse:
+        self.gets.append(url)
+        value = self.mapping[url]
+        if isinstance(value, FakeStreamResponse):
+            return value
+        if isinstance(value, tuple):
+            status, content = value
+            return FakeStreamResponse(content, url, status=status)
+        return FakeStreamResponse(value, url)
+
+    @asynccontextmanager
+    async def stream(
+        self,
+        method: str,
+        url: str,
+        follow_redirects: bool = True,
+    ):
+        del method, follow_redirects
+        yield self._response(url)
 
     async def aclose(self) -> None:
         return None
