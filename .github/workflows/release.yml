@@ -157,7 +157,11 @@ jobs:
           image="$(readlink -f "${images[0]}")"
           chmod +x "${image}"
 
-          "${image}" --version | tee /tmp/qbit-plugin-dl-version.txt
+          # Host toolchains (setup-python) inject LD_LIBRARY_PATH; clear it so the
+          # AppImage runtime and bundled libs win.
+          run_app() { env -u LD_LIBRARY_PATH -u PYTHONPATH -u PYTHONHOME "$@"; }
+
+          run_app "${image}" --version | tee /tmp/qbit-plugin-dl-version.txt
           grep -q 'qbit-plugin-dl' /tmp/qbit-plugin-dl-version.txt
 
           work="$(mktemp -d)"
@@ -165,13 +169,17 @@ jobs:
           trap cleanup EXIT
           (
             cd "${work}"
-            "${image}" --appimage-extract >/dev/null
+            run_app "${image}" --appimage-extract >/dev/null
             bundled="$(find squashfs-root -name 'libxcb-cursor.so.0' | head -1)"
             if [[ -z "${bundled}" ]]; then
               echo "::error::libxcb-cursor.so.0 was not bundled into the AppImage"
               exit 1
             fi
             echo "Bundled cursor lib: ${bundled}"
+            if [[ ! -e squashfs-root/usr/lib/libxcb-cursor.so.0 ]]; then
+              echo "::error::libxcb-cursor.so.0 missing from usr/lib (AppImage LD_LIBRARY_PATH)"
+              exit 1
+            fi
             qxcb="$(find squashfs-root -path '*/platforms/libqxcb.so' | head -1)"
             if [[ -z "${qxcb}" ]]; then
               echo "::error::libqxcb.so missing from AppImage"
@@ -182,16 +190,16 @@ jobs:
               ldd "${qxcb}" | grep -F 'libxcb-cursor' || true
               exit 1
             fi
-            # Prefer evidence the RUNPATH hit the bundled copy.
-            if ! ldd "${qxcb}" | grep -F 'libxcb-cursor.so.0' | grep -q 'PySide6/Qt/lib'; then
-              echo "::warning::libxcb-cursor resolved outside PySide6/Qt/lib (host may provide it)"
-              ldd "${qxcb}" | grep -F 'libxcb-cursor' || true
+            resolved="$(ldd "${qxcb}" | awk '/libxcb-cursor\.so\.0/ {print $3; exit}')"
+            if [[ -n "${resolved}" && "${resolved}" != *"squashfs-root"* ]]; then
+              echo "::warning::libxcb-cursor resolved outside the AppImage tree: ${resolved}"
             fi
           )
 
           # Real xcb platform init under a virtual display (catches missing cursor lib).
           set +e
-          timeout 12 xvfb-run -a "${image}" >/tmp/qbit-plugin-dl-gui.log 2>&1
+          timeout 12 xvfb-run -a env -u LD_LIBRARY_PATH -u PYTHONPATH -u PYTHONHOME \
+            "${image}" >/tmp/qbit-plugin-dl-gui.log 2>&1
           rc=$?
           set -e
           # 124 = still running when timeout fired (expected for a GUI event loop).
@@ -200,7 +208,7 @@ jobs:
             cat /tmp/qbit-plugin-dl-gui.log || true
             exit 1
           fi
-          if grep -qiE 'libxcb-cursor|Could not load the Qt platform plugin|Aborted' /tmp/qbit-plugin-dl-gui.log; then
+          if grep -qiE 'Could not load the Qt platform plugin|libxcb-cursor0 is needed|Aborted' /tmp/qbit-plugin-dl-gui.log; then
             echo "::error::AppImage GUI smoke log shows Qt/platform failure"
             cat /tmp/qbit-plugin-dl-gui.log
             exit 1

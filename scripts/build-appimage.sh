@@ -110,10 +110,11 @@ stage_libxcb_cursor() {
 }
 
 bundle_libxcb_cursor() {
-  # Place libs under PySide6/Qt/lib so libqxcb.so resolves them via RUNPATH
-  # ($ORIGIN/../../lib) without host install or LD_LIBRARY_PATH.
+  # Place libs under PySide6/Qt/lib (libqxcb RUNPATH: $ORIGIN/../../lib) and also
+  # under usr/lib — AppImage runtime prepends usr/lib to LD_LIBRARY_PATH, which
+  # takes precedence over DT_RUNPATH and would otherwise hide the Qt/lib copy.
   local appimage="$1"
-  local work qtlib appimagetool
+  local work qtlib usrlib appimagetool
 
   work="$(mktemp -d "${TMPDIR:-/tmp}/qbit-plugin-dl-repack.XXXXXX")"
   CLEANUP_PATHS+=("${work}")
@@ -130,6 +131,14 @@ bundle_libxcb_cursor() {
     cp -a "${LIB_STAGE}/"* "${qtlib}/"
     if [[ ! -e "${qtlib}/libxcb-cursor.so.0" ]]; then
       echo "Failed to place libxcb-cursor.so.0 in ${qtlib}" >&2
+      exit 1
+    fi
+
+    usrlib="squashfs-root/usr/lib"
+    mkdir -p "${usrlib}"
+    cp -a "${LIB_STAGE}/"* "${usrlib}/"
+    if [[ ! -e "${usrlib}/libxcb-cursor.so.0" ]]; then
+      echo "Failed to place libxcb-cursor.so.0 in ${usrlib}" >&2
       exit 1
     fi
 
