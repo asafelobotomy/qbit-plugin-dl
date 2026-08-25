@@ -19,7 +19,187 @@
 
 Fetches allowlisted catalogs (unofficial MediaWiki list, official `nova3/engines`, and LightDestory), merges duplicates by install filename, lists public and private engines with checkboxes, and downloads only the `.py` files you choose into qBittorrent’s search-plugin directory.
 
-See the repository history prior to the Ko-fi update for the full README body if this temporary stub appears — restoring full content next.
+### Highlights
+
+| | |
+|---|---|
+| **Multi-source catalogs** | Unofficial wiki + official nova3 + LightDestory, each with a 6-hour cache |
+| **Category filters** | anime, books, games, movies, music, pictures, software, tv — plus Adult & Uncategorized |
+| **Safer defaults** | Discouraged wiki entries stay unchecked; static safety check before install; optional ClamAV |
+| **Path detection** | Flatpak and native Linux engine dirs are auto-detected |
+| **One-file AppImage** | Ship a portable Qt GUI without installing Python deps |
+
+## Naming
+
+| Role | Value |
+|------|--------|
+| Display name | qBittorrent Plugin Downloader |
+| CLI / desktop id | `qbit-plugin-dl` |
+| Python package | `qbit_plugin_dl` |
+| Branding asset | `branding/qbit-plugin-dl-icon.png` |
+| Cache / config | `qbit-plugin-dl` under XDG dirs |
+
+## Safety
+
+Unofficial plugins are community Python scripts. **Use them at your own risk.** Prefer reviewing a script before installing.
+
+Before writing an engine, this app runs a **static safety check** (format/encoding, AST import and call policy, nova3 structure heuristics). It never `import`s or `exec`s plugin code. In-process **threads** (`threading`, `concurrent.futures.ThreadPoolExecutor`, `multiprocessing.dummy`) are allowed — official Jackett and many engines use them for parallel HTTP. **OS process spawning** (`multiprocessing.Process` / `Pool`, `ProcessPoolExecutor`) and other high-risk patterns (direct `os.system` / `subprocess`, dynamic `getattr` / `__dict__` access to those APIs, …) are blocked by the review aid. It is not a runtime sandbox and cannot catch every obfuscation. Optional **Safe fixes during install** (off by default) may try same-filename catalog alternates and allowlisted AST rewrites (Py2→Py3, ProcessPool→ThreadPool). AST rewrites require a **clean** ClamAV result unless **Allow AST without ClamAV** is enabled (off by default). Infected content is never fixed. After any rewrite ClamAV is run again when available. Fixed installs show a 🔧 marker in the Name column. When **ClamAV** is installed on the host, the app prefers a running `clamd` via `clamdscan --fdpass` (warm signature DB; scans are serialized). If only one-shot `clamscan` is available, you are asked before each install (choice can be remembered) — `clamscan` reloads the DB and is heavy on RAM, so prefer `clamd` for bulk installs. AppImage/Flatpak sandboxes may not see the host daemon — then only the static check runs. ClamAV errors/timeouts soft-fail (install continues) unless the scan reports infected.
+
+This is a review aid, **not** a claim that plugins are malware-free or verified secure. It is not a sandbox.
+
+Plugins marked ✖ / ❗ / ❌ on the wiki are discouraged and can break other engines. This app never auto-selects them, and “Hide discouraged” leaves them out of the list by default.
+
+On first launch you must **Accept** the safety notice (persisted via Qt settings). **Decline** (or Escape) exits the app.
+
+## Threat model
+
+- Catalog entries come from allowlisted HTTPS sources only (MediaWiki list + GitHub Contents API for known repos). Download URLs use `raw.githubusercontent.com` or the wiki’s listed HTTPS links.
+- Downloads are **streamed** with a hard size abort (**10 MB**), redirect hop cap, and **HTTPS-only** URLs. Each redirect hop is checked before the request (host trust + private/link-local/metadata IP rejection). Auto-trust is **repo-scoped**: only `qbittorrent/search-plugins` and `LightDestory/qBittorrent-Search-Plugins` on `raw.githubusercontent.com`. Other GitHub repos and HTTPS hosts need a one-time or “Always trust” confirmation (asked before install, category resolve, and update checks). DNS rebinding is not fully eliminated.
+- Stale GitHub raw paths (common when wiki rows lag behind repo moves) are recovered via the GitHub git trees API (same repo/ref, matching basename, including `deprecated/` renames) before install/update checks give up.
+- This app validates basenames, runs the static safety check (and optional ClamAV — toggleable in the toolbar), and writes engines under the chosen `nova3/engines` directory with restrictive temp modes and atomic sidecar writes. It does **not** execute plugins.
+- The static check allows in-process threads (needed for Jackett and many engines) and blocks process spawning plus other high-risk APIs (`exec`, `subprocess`, `ctypes`, dynamic attribute indirection, …) and third-party HTTP clients (`requests` / `httpx` / `aiohttp`) that qBittorrent does not ship. It is not a runtime sandbox.
+- Optional safe fixes (off by default): AST rewrites need ClamAV **clean** unless **Allow AST without ClamAV** is on; alternates may still run when ClamAV did not scan. Infected content is never “fixed” into place.
+- Provenance stores a full SHA-256 of installed bytes (plus a short `sha` for older caches). Update checks prefer the full hash when present.
+- **qBittorrent** loads and runs installed engines later.
+- Category resolution parses `supported_categories` with `ast.literal_eval` only (never `exec` / `import` of plugin modules).
+- SHA hashes in the category cache identify source content for cache freshness (6-hour TTL for update markers) — they are not a trust or integrity guarantee against malicious plugins.
+- Static review + optional ClamAV + disclaimer + discouraged filters reduce risk but do not eliminate it. The app never starts `clamd` or elevates privileges for scanning.
+
+## Quick start
+
+### AppImage (recommended)
+
+1. Download the latest AppImage and checksums from
+   [Releases](https://github.com/asafelobotomy/qbit-plugin-dl/releases).
+2. Verify (optional but recommended):
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
+
+3. Make it executable and run:
+
+```bash
+chmod +x qbit-plugin-dl-x86_64.AppImage
+./qbit-plugin-dl-x86_64.AppImage
+```
+
+Release AppImages **bundle** `libxcb-cursor` (needed by Qt 6.5+ on X11). If an older build fails with `libxcb-cursor.so.0: cannot open shared object file` or `no Qt platform plugin could be initialized`, either download a newer release or install the host package:
+
+```bash
+# Debian / Ubuntu
+sudo apt install libxcb-cursor0
+
+# Fedora
+sudo dnf install libxcb-cursor
+
+# Arch
+sudo pacman -S xcb-util-cursor
+```
+
+If the AppImage will not mount (missing FUSE), run:
+
+```bash
+APPIMAGE_EXTRACT_AND_RUN=1 ./qbit-plugin-dl-x86_64.AppImage
+# or: ./qbit-plugin-dl-x86_64.AppImage --appimage-extract-and-run
+```
+
+You still need a normal desktop display (X11 or Wayland). Headless/SSH sessions without `DISPLAY` cannot open the GUI.
+
+#### What is libxcb-cursor?
+
+**XCB** (X C Binding) is the modern C API for talking to an X11 display server. **libxcb-cursor** is a small helper library on top of XCB that loads mouse-cursor images (theme cursors, pointer shapes). Qt’s `xcb` platform plugin links it so the window can show a normal pointer and honor the desktop cursor theme. It is not antivirus software, not part of qBittorrent, and not related to torrent “trackers” — only GUI cursor support under X11. Wayland sessions use a different stack; this dependency matters when Qt selects the `xcb` plugin (typical on X11, and sometimes under XWayland).
+
+### From source
+
+Requires **Python 3.11+**, Linux, network access to GitHub, and the same GUI stack as above (including `libxcb-cursor0` / equivalent when using X11).
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+qbit-plugin-dl
+# or: python -m qbit_plugin_dl
+qbit-plugin-dl --version
+```
+## Usage
+
+1. Accept the safety notice on first launch (Decline exits).
+2. On launch the catalog is force-refreshed (and again every 6 hours while the window stays open) so Version / Updated columns and update markers stay current. You can still click **Refresh catalog** anytime. Categories resolve in the background from each plugin’s `.py`. After that, installed engines are checked for updates; an upwards-arrow marker on the **Name** means the local file differs from the catalog copy. **Update all** remains confirm-gated — nothing is reinstalled automatically.
+3. Filter by name, public/private, **category**, and optionally hide discouraged plugins.
+4. Check the plugins you want. When a **with categories** twin or another **author fork** installs to the same `.py` filename, the preferred engine is the main row (newest non-discouraged fork, then version / categories / qBittorrent 5 hint). Expand the row to pick an alternate instead — only one of the group can be selected.
+5. Confirm the install path (labeled Flatpak / Native / Legacy when recognized).
+6. Click **Install selected**, or **Update all** to reinstall every outdated engine from its catalog URL. Optionally enable **Safe fixes during install** (off by default) to auto-try alternates / AST rewrites after ClamAV; enable **Allow AST without ClamAV** only if you want rewrites when ClamAV did not clean-scan. Use **Uninstall selected** for a full clean of checked installed engines (script, stem-named config like `jackett.json`, bytecode, and install provenance). Then restart qBittorrent or refresh Search plugins.
+
+## Categories
+
+The **Category** filter uses qBittorrent’s native labels (`anime`, `books`, `games`, `movies`, `music`, `pictures`, `software`, `tv`), plus:
+
+- **Adult** — inferred from name/URL for specialty adult indexers (plugins do not declare this)
+- **Uncategorized** — no categories after parsing and fallback
+
+Primary source: each plugin’s `supported_categories` dict in its `.py` file. If a plugin only declares `all`, a small name/URL heuristic fills the gap (e.g. FitGirl → games). Results are cached under `${XDG_CACHE_HOME:-~/.cache}/qbit-plugin-dl/categories.json`.
+
+## Install directories (Linux)
+
+The app prefers the first existing path, otherwise creates the modern native path:
+
+1. `~/.var/app/org.qbittorrent.qBittorrent/data/qBittorrent/nova3/engines` (Flatpak)
+2. `${XDG_DATA_HOME:-~/.local/share}/qBittorrent/nova3/engines` (Native)
+3. `${XDG_DATA_HOME:-~/.local/share}/data/qBittorrent/nova3/engines` (Legacy)
+
+## Build AppImage
+
+Icon refresh requires **ImageMagick** (`magick`) or Pillow. The build also needs `libxcb-cursor.so.0` on the builder (or Debian/Ubuntu `apt-get download` access) so it can embed the library into the AppImage:
+
+```bash
+# Debian / Ubuntu builders
+sudo apt install libxcb-cursor0
+chmod +x scripts/sync-icons.sh scripts/build-appimage.sh
+./scripts/sync-icons.sh   # branding → resources + AppImage PNG
+./scripts/build-appimage.sh
+```
+
+Builds a wheel, syncs icons, generates `appimage/requirements.txt`, runs [`python-appimage`](https://github.com/niess/python-appimage), then injects `libxcb-cursor` into `PySide6/Qt/lib` and repacks. Override the bundled Python with `PYTHON_VERSION=3.12` (default).
+
+`APPIMAGE_EXTRACT_AND_RUN=1` is set so `appimagetool` works without FUSE. The result is `qbit-plugin-dl-x86_64.AppImage` (~200+ MB because of Qt).
+## Tests
+
+```bash
+QT_QPA_PLATFORM=offscreen pytest
+```
+
+GUI smoke tests need an offscreen Qt platform (CI sets this). Plain `pytest` often works via a test-side default, but matching CI is more reliable.
+
+## Releases
+
+GitHub Actions publishes a release when `pyproject.toml` / `__init__.py` version is bumped on `main` (and AppStream lists the same version). The workflow builds the AppImage, attaches `SHA256SUMS.txt`, and writes release notes from commits since the previous tag (plus GitHub’s generated changelog).
+
+You can also run **Actions → Release → Run workflow** with **force** to publish the current version if its tag does not exist yet.
+
+## Catalog sources
+
+v1 merges three allowlisted providers (best-effort; one failure does not block the others):
+
+| id | Source | Path |
+|----|--------|------|
+| `wiki` | [Unofficial-search-plugins.mediawiki](https://raw.githubusercontent.com/qbittorrent/search-plugins/master/wiki/Unofficial-search-plugins.mediawiki) | MediaWiki table |
+| `official` | [`qbittorrent/search-plugins`](https://github.com/qbittorrent/search-plugins) | `nova3/engines/*.py` |
+| `lightdestory` | [`LightDestory/qBittorrent-Search-Plugins`](https://github.com/LightDestory/qBittorrent-Search-Plugins) | `src/engines/*.py` |
+
+GitHub providers use the public Contents API (≈60 unauthenticated requests/hour) and build HTTPS `raw.githubusercontent.com` download URLs only. `__init__.py` and `template.py` are skipped. Official `jackett.py` is included; it needs a **local Jackett** instance after install.
+
+Download auto-trust matches these two GitHub repos only. Wiki rows that point at other authors’ repositories require confirmation before install.
+
+Results are concatenated, then grouped with the same with-categories / author-fork scoring as before (same install filename → one row with alternates).
+
+Caches (6-hour TTL) under `${XDG_CACHE_HOME:-~/.cache}/qbit-plugin-dl/`:
+
+- `catalog-wiki.mediawiki` (migrated from legacy `catalog.mediawiki` if present)
+- `sources/{id}.json` for each GitHub listing
+- `installed.json` — download URL + content hash recorded on successful installs (used for update checks)
+
+Homepage: [github.com/asafelobotomy/qbit-plugin-dl](https://github.com/asafelobotomy/qbit-plugin-dl). AppStream still lists the upstream wiki as help.
 
 ## License
 
