@@ -1004,3 +1004,69 @@ def test_filename_conflict_check_covers_hidden_rows(tmp_path: Path, monkeypatch)
     assert window._checked == {window._plugin_key(mine), window._plugin_key(other)}
     window.close()
     assert app is not None
+
+
+def test_dynamic_text_never_rendered_as_html(tmp_path: Path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    from qbit_plugin_dl.gui import show_plain_message
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-plain")
+    boxes: list[QMessageBox] = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: boxes.append(self) or 0)
+
+    evil = "<a href='file:///etc/passwd'>click</a><img src='https://x/y.png'>"
+    show_plain_message(window, QMessageBox.Icon.Critical, "Install error", evil)
+    assert boxes[-1].textFormat() == Qt.TextFormat.PlainText
+    assert boxes[-1].text() == evil
+
+    assert window.status_label.textFormat() == Qt.TextFormat.PlainText
+    window._set_status(f"Foo <h1 style='font-size:80px'>: {evil}")
+    assert "<h1" not in window.status_label.toolTip().removeprefix("<qt>")
+    window.close()
+    assert app is not None
+
+
+def test_update_all_defaults_to_no(tmp_path: Path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-upd")
+    boxes: list[QMessageBox] = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: boxes.append(self) or 0)
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: None)
+    started: list[object] = []
+    monkeypatch.setattr(window, "_start_install", started.append)
+
+    window._all_plugins = [_plugin()]
+    window._updates = {"demo.py"}
+    window.update_all_outdated()
+
+    box = boxes[-1]
+    assert box.standardButton(box.defaultButton()) == QMessageBox.StandardButton.No
+    assert "Demo" in box.text()
+    assert started == []  # dismissed dialog never reinstalls
+    window.close()
+    assert app is not None
+
+
+def test_controls_stay_disabled_while_install_runs(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-busy")
+    window._install_worker = SimpleNamespace(isRunning=lambda: True)  # type: ignore[assignment]
+    window._set_busy_for_install(True)
+    assert not window.path_combo.isEnabled()
+    assert not window.browse_btn.isEnabled()
+    assert not window.refresh_btn.isEnabled()
+
+    # A category job finishing mid-install must not re-enable Refresh.
+    monkeypatch.setattr(window, "_start_update_check", lambda: None)
+    window._on_categories_loaded([])
+    assert not window.refresh_btn.isEnabled()
+
+    window._install_worker = SimpleNamespace(isRunning=lambda: False)  # type: ignore[assignment]
+    window._set_busy_for_install(False)
+    assert window.path_combo.isEnabled() and window.refresh_btn.isEnabled()
+    window._install_worker = None
+    window.close()
+    assert app is not None

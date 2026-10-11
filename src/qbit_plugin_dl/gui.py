@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 import threading
 import warnings
@@ -1062,6 +1063,33 @@ class InstallSummaryDialog(QDialog):
         return style.standardIcon(sp)
 
 
+def show_plain_message(
+    parent: QWidget | None,
+    icon: QMessageBox.Icon,
+    title: str,
+    text: str,
+    *,
+    buttons: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok,
+    default: QMessageBox.StandardButton | None = None,
+) -> QMessageBox.StandardButton:
+    """
+    Modal message box that never interprets *text* as HTML.
+
+    The static ``QMessageBox.warning()``/``critical()`` helpers auto-detect rich
+    text and open links, and their text here often includes catalog-controlled
+    plugin names, URLs or error strings.
+    """
+    box = QMessageBox(icon, title, text, buttons, parent)
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    if default is not None:
+        box.setDefaultButton(default)
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked is None:
+        return QMessageBox.StandardButton.NoButton
+    return box.standardButton(clicked)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, icon: QIcon | None = None) -> None:
         super().__init__()
@@ -1178,9 +1206,9 @@ class MainWindow(QMainWindow):
         self._populate_path_combo()
         self.path_combo.currentIndexChanged.connect(self._on_path_changed)
         path_row.addWidget(self.path_combo, stretch=1)
-        browse_btn = QPushButton("Browse…")
-        browse_btn.clicked.connect(self._browse_path)
-        path_row.addWidget(browse_btn)
+        self.browse_btn = QPushButton("Browse…")
+        self.browse_btn.clicked.connect(self._browse_path)
+        path_row.addWidget(self.browse_btn)
         layout.addLayout(path_row)
 
         self.private_note = QLabel(
@@ -1254,6 +1282,8 @@ class MainWindow(QMainWindow):
 
         # Own row so long install status text cannot widen the main window.
         self.status_label = QLabel("Loading catalog…")
+        # Status lines include catalog-controlled names and URLs.
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.status_label.setWordWrap(True)
         self.status_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
@@ -1569,6 +1599,7 @@ class MainWindow(QMainWindow):
         self._catalog_worker = worker
         worker.finished_ok.connect(self._on_catalog_loaded)
         worker.failed.connect(self._on_catalog_failed)
+        worker.finished.connect(self._on_worker_thread_finished)
         worker.start()
 
     def _on_catalog_loaded(self, plugins: list, summary: str = "") -> None:
@@ -1588,7 +1619,7 @@ class MainWindow(QMainWindow):
         if self._category_worker and self._category_worker.isRunning():
             return
         if not self._all_plugins:
-            self.refresh_btn.setEnabled(True)
+            self._sync_refresh_button()
             self._start_update_check()
             return
         self.refresh_btn.setEnabled(False)
@@ -1612,6 +1643,7 @@ class MainWindow(QMainWindow):
         worker.progress.connect(self._on_category_progress)
         worker.finished_ok.connect(self._on_categories_loaded)
         worker.failed.connect(self._on_categories_failed)
+        worker.finished.connect(self._on_worker_thread_finished)
         worker.start()
 
     def _on_category_progress(self, done: int, total: int) -> None:
@@ -1621,7 +1653,7 @@ class MainWindow(QMainWindow):
 
     def _on_categories_loaded(self, plugins: list) -> None:
         self._all_plugins = plugins
-        self.refresh_btn.setEnabled(True)
+        self._sync_refresh_button()
         self.progress.setVisible(False)
         categorized = sum(1 for p in plugins if p.categories)
         self._status_base = f"{self._status_base} — {categorized} categorized"
@@ -1630,16 +1662,20 @@ class MainWindow(QMainWindow):
         self._start_update_check()
 
     def _on_categories_failed(self, message: str) -> None:
-        self.refresh_btn.setEnabled(True)
+        self._sync_refresh_button()
         self.progress.setVisible(False)
         self.status_label.setText(f"{self._status_base} — category resolve failed")
-        QMessageBox.warning(self, "Category resolve", message)
+        show_plain_message(
+            self, QMessageBox.Icon.Warning, "Category resolve", message
+        )
         self._start_update_check()
 
     def _on_catalog_failed(self, message: str) -> None:
-        self.refresh_btn.setEnabled(True)
+        self._sync_refresh_button()
         self.status_label.setText("Catalog fetch failed")
-        QMessageBox.critical(self, "Catalog error", message)
+        show_plain_message(
+            self, QMessageBox.Icon.Critical, "Catalog error", message
+        )
 
     def apply_filters(self) -> None:
         visibility = self.visibility_combo.currentData()
@@ -1670,8 +1706,33 @@ class MainWindow(QMainWindow):
     def _set_busy_for_install(self, busy: bool) -> None:
         self.install_btn.setEnabled(not busy)
         self.uninstall_btn.setEnabled(not busy)
-        self.refresh_btn.setEnabled(not busy)
+        # Changing the target dir mid-install would report results for, and
+        # refresh "Installed" against, the wrong folder.
+        self.path_combo.setEnabled(not busy)
+        self.browse_btn.setEnabled(not busy)
+        self._sync_refresh_button()
         self._sync_update_all_button(busy=busy)
+
+    def _on_worker_thread_finished(self) -> None:
+        # Result slots run before the QThread reports finished; re-sync once
+        # it really has, so buttons never stay stuck disabled.
+        if self._closing:
+            return
+        self._sync_refresh_button()
+        self._sync_update_all_button()
+
+    def _sync_refresh_button(self) -> None:
+        """Refresh is available only when no catalog/category/install job runs."""
+        busy = any(
+            worker is not None and worker.isRunning()
+            for worker in (
+                self._catalog_worker,
+                self._category_worker,
+                self._install_worker,
+                self._uninstall_worker,
+            )
+        )
+        self.refresh_btn.setEnabled(not busy and not self._closing)
 
     def _sync_update_all_button(self, *, busy: bool | None = None) -> None:
         if busy is None:
@@ -1715,6 +1776,7 @@ class MainWindow(QMainWindow):
         worker.finished_ok.connect(self._on_updates_checked)
         worker.failed.connect(self._on_updates_failed)
         worker.finished.connect(self._on_update_worker_done)
+        worker.finished.connect(self._on_worker_thread_finished)
         worker.start()
 
     def _update_result_is_current(self) -> bool:
@@ -1751,7 +1813,9 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"{self._status_base} — update check failed")
         self._sync_update_all_button()
         if message:
-            QMessageBox.warning(self, "Update check", message)
+            show_plain_message(
+            self, QMessageBox.Icon.Warning, "Update check", message
+        )
 
     def _on_header_section_clicked(self, section: int) -> None:
         """Toggle ascending/descending sort for the clicked column."""
@@ -1872,7 +1936,9 @@ class MainWindow(QMainWindow):
     def install_selected(self) -> None:
         plugins = self._selected_plugins()
         if not plugins:
-            QMessageBox.information(self, "Nothing selected", "Select at least one plugin.")
+            show_plain_message(
+            self, QMessageBox.Icon.Information, "Nothing selected", "Select at least one plugin."
+        )
             return
         plugins = self._confirm_hidden_selection(plugins)
         if plugins:
@@ -1919,7 +1985,9 @@ class MainWindow(QMainWindow):
     def uninstall_selected(self) -> None:
         plugins = self._selected_plugins()
         if not plugins:
-            QMessageBox.information(self, "Nothing selected", "Select at least one plugin.")
+            show_plain_message(
+            self, QMessageBox.Icon.Information, "Nothing selected", "Select at least one plugin."
+        )
             return
 
         # Dedupe by filename for the confirm message (same as uninstall API).
@@ -1930,8 +1998,9 @@ class MainWindow(QMainWindow):
             p for p in by_filename.values() if p.filename in self._installed
         ]
         if not installed:
-            QMessageBox.information(
+            show_plain_message(
                 self,
+                QMessageBox.Icon.Information,
                 "Nothing installed",
                 "None of the selected plugins are installed in the current "
                 "engines directory.",
@@ -1939,8 +2008,9 @@ class MainWindow(QMainWindow):
             return
 
         names = _format_name_list([p.name for p in installed])
-        answer = QMessageBox.question(
+        answer = show_plain_message(
             self,
+            QMessageBox.Icon.Question,
             "Uninstall selected",
             (
                 f"Permanently remove {len(installed)} installed engine(s) "
@@ -1951,8 +2021,8 @@ class MainWindow(QMainWindow):
                 "bytecode, and this app’s install provenance. "
                 "This cannot be undone."
             ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+            buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            default=QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -1963,18 +2033,22 @@ class MainWindow(QMainWindow):
             return
         plugins = plugins_for_updates(self._updates, self._all_plugins)
         if not plugins:
-            QMessageBox.information(
+            show_plain_message(
                 self,
+                QMessageBox.Icon.Information,
                 "Nothing to update",
                 "No catalog matches were found for the outdated engines.",
             )
             return
-        answer = QMessageBox.question(
+        names = _format_name_list([p.name for p in plugins])
+        answer = show_plain_message(
             self,
+            QMessageBox.Icon.Question,
             "Update all",
-            f"Update {len(plugins)} plugin(s) from the catalog?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
+            f"Reinstall {len(plugins)} plugin(s) from the catalog?\n\n{names}",
+            buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            # A bulk reinstall should never be one stray Enter away.
+            default=QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -2059,6 +2133,7 @@ class MainWindow(QMainWindow):
         worker.progress.connect(self._on_install_progress)
         worker.finished_ok.connect(self._on_install_finished)
         worker.failed.connect(self._on_install_failed)
+        worker.finished.connect(self._on_worker_thread_finished)
         worker.start()
 
     def _start_uninstall(self, plugins: list[Plugin]) -> None:
@@ -2078,11 +2153,14 @@ class MainWindow(QMainWindow):
         worker.progress.connect(self._on_install_progress)
         worker.finished_ok.connect(self._on_uninstall_finished)
         worker.failed.connect(self._on_uninstall_failed)
+        worker.finished.connect(self._on_worker_thread_finished)
         worker.start()
 
     def _set_status(self, text: str) -> None:
         """Update status without letting long lines grow the window width."""
-        self.status_label.setToolTip(text)
+        # Tooltips auto-detect rich text; escape and mark as rich so the
+        # literal text is shown.
+        self.status_label.setToolTip(f"<qt>{html.escape(text)}</qt>")
         display = text if len(text) <= 96 else f"{text[:93]}…"
         self.status_label.setText(display)
 
@@ -2119,7 +2197,9 @@ class MainWindow(QMainWindow):
         self._set_busy_for_install(False)
         self.progress.setVisible(False)
         self._set_status("Install error")
-        QMessageBox.critical(self, "Install error", message)
+        show_plain_message(
+            self, QMessageBox.Icon.Critical, "Install error", message
+        )
 
     def _on_uninstall_finished(self, results: list) -> None:
         self._set_busy_for_install(False)
@@ -2139,7 +2219,9 @@ class MainWindow(QMainWindow):
         self._set_busy_for_install(False)
         self.progress.setVisible(False)
         self._set_status("Uninstall error")
-        QMessageBox.critical(self, "Uninstall error", message)
+        show_plain_message(
+            self, QMessageBox.Icon.Critical, "Uninstall error", message
+        )
 
     def _all_workers(self) -> list[QThread]:
         return [

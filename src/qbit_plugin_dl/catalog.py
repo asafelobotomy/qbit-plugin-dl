@@ -42,8 +42,10 @@ def sources_cache_dir() -> Path:
     return path
 
 
-_MW_LINK = re.compile(r"\[(https?://[^\s\]]+)\s+([^\]]+)\]")
-_MW_BARE_URL = re.compile(r"(https?://[^\s\]|<]+)")
+# URLs never contain raw <, > or quotes; excluding them keeps markup-looking
+# fragments out of download URLs (and any status/error text built from them).
+_MW_LINK = re.compile(r"\[(https?://[^\s\]<>\"']+)\s+([^\]]+)\]")
+_MW_BARE_URL = re.compile(r"(https?://[^\s\]|<>\"']+)")
 _BR_TAG = re.compile(r"<br\s*/?>", re.IGNORECASE)
 _HTML_TAG = re.compile(r"<[^>]+>")
 _WARNING_MARKERS = ("✖", "❗", "❌")
