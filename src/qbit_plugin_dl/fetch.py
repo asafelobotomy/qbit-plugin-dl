@@ -11,6 +11,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from qbit_plugin_dl.url_recover import (
+    is_github_raw_host,
     is_http_not_found,
     parse_github_raw_url,
     recover_github_raw_url,
@@ -96,6 +97,10 @@ def trust_key_for_url(url: str) -> str | None:
     raw = parse_github_raw_url(url)
     if raw is not None:
         return github_repo_trust_key(raw.owner, raw.repo)
+    if is_github_raw_host(url):
+        # Malformed raw URL (dot segments, encoded separators, …): never offer a
+        # CDN-wide hostname key, which would bypass repo-scoped consent.
+        return None
     host = hostname_from_url(url)
     return host or None
 
@@ -150,8 +155,7 @@ def url_is_trusted(
     if key is not None and key in keys:
         return True
     # Non-GitHub-raw hosts (incl. gist CDN): hostname consent.
-    raw = parse_github_raw_url(url)
-    if raw is not None:
+    if is_github_raw_host(url):
         return False
     host = hostname_from_url(url)
     return bool(host) and host in keys
@@ -259,6 +263,11 @@ def check_download_host(
     if not host:
         return f"Invalid download URL: {url}"
     if not url_is_trusted(url, trusted_hosts):
+        if is_github_raw_host(url) and parse_github_raw_url(url) is None:
+            return (
+                f"Refusing malformed GitHub raw URL (dot segments or encoded "
+                f"separators): {url}"
+            )
         key = trust_key_for_url(url) or host
         if key.startswith("github:"):
             return (

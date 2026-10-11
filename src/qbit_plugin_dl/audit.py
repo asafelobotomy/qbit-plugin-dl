@@ -193,6 +193,8 @@ _OS_DANGEROUS_ATTRS: frozenset[str] = frozenset(
     }
 )
 
+_OS_MODULES: frozenset[str] = frozenset({"os", "posix", "nt"})
+
 _DECODE_FUNCS: frozenset[str] = frozenset(
     {
         "b64decode",
@@ -228,6 +230,12 @@ _DANGEROUS_ATTR_NAMES: frozenset[str] = frozenset(
         "dumps",
         "dump",
     }
+)
+
+# Modules whose objects must not be passed around as plain values (``m = os``,
+# ``getattr(os, name)``): doing so hides which attribute is used later.
+_SENSITIVE_MODULES: frozenset[str] = frozenset(
+    {"os", "posix", "nt", "builtins", "subprocess", "ctypes", "importlib"}
 )
 
 _DYN_ATTR_FUNCS: frozenset[str] = frozenset(
@@ -388,9 +396,52 @@ def _attr_chain(node: ast.AST) -> list[str] | None:
     return None
 
 
+def _fold_str(node: ast.AST | None) -> str | None:
+    """Statically evaluate simple constant string expressions (``'sy' + 'stem'``)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _fold_str(node.left), _fold_str(node.right)
+        if left is not None and right is not None:
+            return left + right
+        return None
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            if isinstance(value, ast.FormattedValue):
+                if value.conversion != -1 or value.format_spec is not None:
+                    return None
+                folded = _fold_str(value.value)
+            else:
+                folded = _fold_str(value)
+            if folded is None:
+                return None
+            parts.append(folded)
+        return "".join(parts)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], (ast.List, ast.Tuple))
+    ):
+        sep = _fold_str(node.func.value)
+        items = [_fold_str(elt) for elt in node.args[0].elts]
+        if sep is not None and all(item is not None for item in items):
+            return sep.join(items)  # type: ignore[arg-type]
+    return None
+
+
 class _PolicyVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.findings: list[AuditFinding] = []
+        # Local name -> dotted origin from ``import x as y`` / ``from x import y``,
+        # so aliases (``import os as o``, ``from os import system``) resolve.
+        self._aliases: dict[str, str] = {}
+        # ids of nodes already judged in context (call targets, attribute bases,
+        # vetted getattr receivers, membership tests) — not plain value refs.
+        self._judged: set[int] = set()
         self.decode_names: set[str] = set()
         self.saw_decode_call = False
         self.saw_dyn_exec = False
@@ -440,6 +491,11 @@ class _PolicyVisitor(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             self._check_import(alias.name, node.lineno)
+            if alias.asname:
+                self._aliases[alias.asname] = alias.name
+            else:
+                root = _root_module(alias.name)
+                self._aliases[root] = root
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.level and not node.module:
@@ -464,6 +520,12 @@ class _PolicyVisitor(ast.NodeVisitor):
         if module:
             self._check_import(module, node.lineno)
             self._check_import_from_names(module, node.names, node.lineno)
+            if not node.level:
+                for alias in node.names:
+                    if alias.name != "*":
+                        self._aliases[alias.asname or alias.name] = (
+                            f"{module}.{alias.name}"
+                        )
         elif node.level == 0:
             self.findings.append(
                 _finding(
@@ -555,17 +617,77 @@ class _PolicyVisitor(ast.NodeVisitor):
             )
 
     def visit_Call(self, node: ast.Call) -> None:
+        # The call target is judged by _check_call; don't re-flag it as a
+        # bare reference when generic_visit walks into it.
+        current: ast.AST = node.func
+        while True:
+            self._judged.add(id(current))
+            if not isinstance(current, ast.Attribute):
+                break
+            current = current.value
         self._check_call(node)
         self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
         self._check_dangerous_subscript(node)
+        if isinstance(node.ctx, ast.Load) and self._resolved_chain(node.value) == [
+            "sys",
+            "modules",
+        ]:
+            self._fail_sys_modules(node.lineno)
         self.generic_visit(node)
 
+    def visit_Compare(self, node: ast.Compare) -> None:
+        # ``"x" in sys.modules`` is a harmless membership test.
+        for op, comparator in zip(node.ops, node.comparators):
+            if isinstance(op, (ast.In, ast.NotIn)):
+                self._judged.add(id(comparator))
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        self._judged.add(id(node.value))
+        if isinstance(node.ctx, ast.Load) and id(node) not in self._judged:
+            chain = self._resolved_chain(node)
+            sink = _sink_for_chain(chain) if chain else None
+            if sink is not None:
+                code, label = sink
+                self._fail_reference(code, label, node.lineno)
+                return
+        self.generic_visit(node)
+
+    def _resolved_chain(self, node: ast.AST) -> list[str] | None:
+        """Attribute chain with the root import alias expanded (``o.system`` → os)."""
+        chain = _attr_chain(node)
+        if not chain:
+            return None
+        origin = self._aliases.get(chain[0])
+        if origin is None:
+            return chain
+        return origin.split(".") + chain[1:]
+
+    def _fail_reference(self, code: str, label: str, lineno: int) -> None:
+        if code == "DYN_EXEC":
+            self.saw_dyn_exec = True
+        self.findings.append(
+            _finding(
+                code,
+                SEVERITY_FAIL,
+                f"Reference to {label} at line {lineno} "
+                "(aliasing a dangerous callable)",
+            )
+        )
+
+    def _fail_sys_modules(self, lineno: int) -> None:
+        self.findings.append(
+            _finding(
+                "SYS_MODULES",
+                SEVERITY_FAIL,
+                f"Module lookup via sys.modules at line {lineno}",
+            )
+        )
+
     def _constant_str(self, node: ast.AST | None) -> str | None:
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            return node.value
-        return None
+        return _fold_str(node)
 
     def _check_dangerous_attr_name(self, name: str, lineno: int, *, via: str) -> None:
         if name not in _DANGEROUS_ATTR_NAMES:
@@ -603,31 +725,52 @@ class _PolicyVisitor(ast.NodeVisitor):
         if isinstance(func, ast.Name) and func.id in _DYN_ATTR_FUNCS:
             # getattr(obj, "system") — name is 2nd arg; vars(obj) alone is warn-free.
             if func.id in {"getattr", "setattr", "delattr"} and len(node.args) >= 2:
-                name = self._constant_str(node.args[1])
-                if name is not None:
-                    self._check_dangerous_attr_name(name, lineno, via=func.id)
-                    return True
+                self._check_dyn_attr_name_arg(
+                    node.args[1], lineno, via=func.id, receiver=node.args[0]
+                )
+                return True
             return False
 
-        chain = _attr_chain(func)
+        chain = self._resolved_chain(func)
         if not chain:
             return False
         if chain[0] == "operator" and chain[-1] in {"attrgetter", "methodcaller"}:
             if node.args:
-                name = self._constant_str(node.args[0])
-                if name is not None:
-                    self._check_dangerous_attr_name(
-                        name, lineno, via=".".join(chain)
-                    )
-                    return True
-        if chain[-1] in _DYN_ATTR_FUNCS and len(node.args) >= 2:
-            name = self._constant_str(node.args[1])
-            if name is not None:
-                self._check_dangerous_attr_name(
-                    name, lineno, via=".".join(chain)
+                self._check_dyn_attr_name_arg(
+                    node.args[0], lineno, via=".".join(chain), receiver=None
                 )
                 return True
+        if chain[-1] in _DYN_ATTR_FUNCS and len(node.args) >= 2:
+            self._check_dyn_attr_name_arg(
+                node.args[1], lineno, via=".".join(chain), receiver=node.args[0]
+            )
+            return True
         return False
+
+    def _check_dyn_attr_name_arg(
+        self,
+        name_node: ast.AST,
+        lineno: int,
+        *,
+        via: str,
+        receiver: ast.AST | None,
+    ) -> None:
+        name = self._constant_str(name_node)
+        if name is not None:
+            self._check_dangerous_attr_name(name, lineno, via=via)
+            if name not in _DANGEROUS_ATTR_NAMES and receiver is not None:
+                # Fully known attribute: the receiver isn't an opaque module ref.
+                self._judged.add(id(receiver))
+            return
+        # Name not statically known. Receivers that are sensitive modules are
+        # still caught as MODULE_REF when visited; elsewhere this is unusual.
+        self.findings.append(
+            _finding(
+                "DYN_ATTR_DYNAMIC",
+                SEVERITY_WARN,
+                f"Attribute name computed at runtime via {via} at line {lineno}",
+            )
+        )
 
     def _check_call(self, node: ast.Call) -> None:
         func = node.func
@@ -656,8 +799,26 @@ class _PolicyVisitor(ast.NodeVisitor):
             )
             return
 
-        chain = _attr_chain(func)
+        chain = self._resolved_chain(func)
         if not chain:
+            return
+
+        if chain[0] in {"builtins", "__builtins__"} and len(chain) >= 2 and (
+            chain[1] in _DANGEROUS_BUILTINS
+        ):
+            self.saw_dyn_exec = True
+            self.findings.append(
+                _finding(
+                    "DYN_EXEC",
+                    SEVERITY_FAIL,
+                    f"Dangerous call {'.'.join(chain)}() at line {node.lineno}",
+                )
+            )
+            self._check_decode_exec_args(node)
+            return
+
+        if chain[:2] == ["sys", "modules"] and len(chain) >= 3:
+            self._fail_sys_modules(node.lineno)
             return
 
         if chain[-1] == "ProcessPoolExecutor":
@@ -684,7 +845,7 @@ class _PolicyVisitor(ast.NodeVisitor):
                 )
                 return
 
-        if chain[0] == "os" and len(chain) >= 2 and chain[1] in _OS_DANGEROUS_ATTRS:
+        if chain[0] in _OS_MODULES and len(chain) >= 2 and chain[1] in _OS_DANGEROUS_ATTRS:
             self.findings.append(
                 _finding(
                     "OS_EXEC",
@@ -783,6 +944,48 @@ class _PolicyVisitor(ast.NodeVisitor):
                 )
             )
 
+    def _check_name_load(self, node: ast.Name) -> None:
+        judged = id(node) in self._judged
+        if node.id in _DANGEROUS_BUILTINS:
+            if not judged:
+                # ``run = eval`` hides the later call from the DYN_EXEC check.
+                self.saw_dyn_exec = True
+                self.findings.append(
+                    _finding(
+                        "BUILTIN_REF",
+                        SEVERITY_FAIL,
+                        f"Dangerous builtin {node.id!r} referenced at line "
+                        f"{node.lineno} (not called directly)",
+                    )
+                )
+            return
+        if node.id == "__builtins__":
+            self.findings.append(
+                _finding(
+                    "BUILTINS_REF",
+                    SEVERITY_FAIL,
+                    f"Access to __builtins__ at line {node.lineno}",
+                )
+            )
+            return
+        origin = self._aliases.get(node.id)
+        if origin is None or judged:
+            return
+        chain = origin.split(".")
+        sink = _sink_for_chain(chain)
+        if sink is not None:
+            code, label = sink
+            self._fail_reference(code, label, node.lineno)
+        elif len(chain) == 1 and chain[0] in _SENSITIVE_MODULES:
+            self.findings.append(
+                _finding(
+                    "MODULE_REF",
+                    SEVERITY_FAIL,
+                    f"Module {origin!r} used as a value at line {node.lineno} "
+                    "(hides which attribute is accessed)",
+                )
+            )
+
     def _check_decode_exec_args(self, node: ast.Call) -> None:
         for arg in node.args:
             if isinstance(arg, ast.Call):
@@ -878,15 +1081,8 @@ class _PolicyVisitor(ast.NodeVisitor):
                 )
 
     def visit_Name(self, node: ast.Name) -> None:
-        if isinstance(node.ctx, ast.Load) and node.id in _DANGEROUS_BUILTINS:
-            self.findings.append(
-                _finding(
-                    "BUILTIN_REF",
-                    SEVERITY_WARN,
-                    f"Dangerous builtin {node.id!r} referenced at line "
-                    f"{node.lineno} (not called here)",
-                )
-            )
+        if isinstance(node.ctx, ast.Load):
+            self._check_name_load(node)
         if isinstance(node.ctx, ast.Store):
             normalized = unicodedata.normalize("NFKC", node.id)
             if normalized != node.id or any(ord(ch) > 127 for ch in node.id):
@@ -899,6 +1095,35 @@ class _PolicyVisitor(ast.NodeVisitor):
                     )
                 )
         self.generic_visit(node)
+
+
+def _sink_for_chain(chain: list[str]) -> tuple[str, str] | None:
+    """(finding code, label) when a resolved dotted name is a dangerous callable."""
+    dotted = ".".join(chain)
+    root = chain[0]
+    if (
+        root in {"builtins", "__builtins__"}
+        and len(chain) >= 2
+        and chain[1] in _DANGEROUS_BUILTINS
+    ):
+        return "DYN_EXEC", dotted
+    if root in _OS_MODULES and len(chain) >= 2 and chain[1] in _OS_DANGEROUS_ATTRS:
+        return "OS_EXEC", dotted
+    if chain[-1] == "ProcessPoolExecutor":
+        return "PROCESS_EXEC", dotted
+    if (
+        root == "multiprocessing"
+        and len(chain) >= 2
+        and chain[1] in _MULTIPROCESSING_PROCESS_ATTRS
+    ):
+        return "PROCESS_EXEC", dotted
+    if root == "subprocess" and len(chain) >= 2:
+        return "SUBPROCESS", dotted
+    if root == "ctypes" and len(chain) >= 2:
+        return "CTYPES", dotted
+    if root in {"marshal", "pickle", "_pickle"} and chain[-1] in {"loads", "load"}:
+        return "PICKLE_MARSHAL", dotted
+    return None
 
 
 def _try_handles_import_error(node: ast.Try) -> bool:

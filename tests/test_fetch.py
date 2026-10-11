@@ -345,3 +345,79 @@ def test_update_truncated_fallback(tmp_path: Path):
         remote_shas={plugin.download_url: content_sha(body)},
     )
     assert outdated == set()
+
+
+_DOT_SEGMENT_URLS = [
+    "https://raw.githubusercontent.com/qbittorrent/search-plugins/../../attacker/evil/master/x.py",
+    "https://raw.githubusercontent.com/qbittorrent/search-plugins/master/../../../attacker/evil/master/x.py",
+    "https://raw.githubusercontent.com/qbittorrent/search-plugins/%2E%2E/%2e%2e/attacker/evil/master/x.py",
+    "https://raw.githubusercontent.com/qbittorrent/search-plugins/master/..%2F..%2Fattacker/x.py",
+    "https://raw.githubusercontent.com/qbittorrent/search-plugins/master/%252E%252E/x.py",
+    "https://raw.githubusercontent.com/qbittorrent/search-plugins//master/x.py",
+    "https://raw.githubusercontent.com/qbittorrent/search-plugins/./master/x.py",
+]
+
+
+@pytest.mark.parametrize("url", _DOT_SEGMENT_URLS)
+def test_dot_segment_raw_urls_never_trusted(url: str):
+    """httpx resolves ``..`` before sending, so the repo check must refuse them."""
+    assert not is_url_allowlisted(url)
+    assert trust_key_for_url(url) is None
+    # No consent key is offered, and CDN-wide host trust does not cover them.
+    assert untrusted_hosts_in_urls([url]) == []
+    assert not url_is_trusted(url, {"raw.githubusercontent.com"})
+    assert not url_is_trusted(url, {"github:qbittorrent/search-plugins"})
+    message = check_download_host(url, check_private=False)
+    assert message is not None and "malformed GitHub raw URL" in message
+
+
+@pytest.mark.parametrize("url", _DOT_SEGMENT_URLS)
+def test_dot_segment_raw_url_not_fetched(url: str):
+    client = AsyncRedirectClient({url: FakeStreamResponse(b"pwned", url)})
+
+    async def _run():
+        return await fetch_plugin_bytes_async(
+            client,  # type: ignore[arg-type]
+            url,
+            check_private=False,
+        )
+
+    result = asyncio.run(_run())
+    assert isinstance(result, FetchError)
+    assert result.code == "host"
+    assert client.gets == []
+
+
+def test_dot_segment_redirect_hop_rejected():
+    start = "https://raw.githubusercontent.com/qbittorrent/search-plugins/master/a.py"
+    hop = (
+        "https://raw.githubusercontent.com/qbittorrent/search-plugins/"
+        "../../attacker/evil/master/a.py"
+    )
+    client = AsyncRedirectClient(
+        {
+            start: FakeStreamResponse(b"", start, status=302, headers={"Location": hop}),
+        }
+    )
+
+    async def _run():
+        return await fetch_plugin_bytes_async(
+            client,  # type: ignore[arg-type]
+            start,
+            check_private=False,
+        )
+
+    result = asyncio.run(_run())
+    assert isinstance(result, FetchError)
+    assert client.gets == [start]
+
+
+def test_blob_link_with_encoded_traversal_not_trusted():
+    from qbit_plugin_dl.catalog import normalize_download_url
+
+    url = normalize_download_url(
+        "https://github.com/qbittorrent/search-plugins/blob/master/"
+        "..%2F..%2F..%2Fattacker/evil/master/x.py"
+    )
+    assert not is_url_allowlisted(url)
+    assert trust_key_for_url(url) is None

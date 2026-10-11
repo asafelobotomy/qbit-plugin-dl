@@ -220,3 +220,35 @@ def test_timeout_is_error_not_block():
     assert status == "error"
     assert any(f.code == "CLAM_TIMEOUT" for f in findings)
     assert all(f.severity != "fail" for f in findings)
+
+
+def test_concurrent_first_scans_wait_for_backend_probe():
+    """Scans racing the first (slow) clamd ping must not report ``skipped``."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    ping_started = threading.Event()
+
+    def which(name: str) -> str | None:
+        return f"/usr/bin/{name}" if name in {"clamdscan", "clamscan"} else None
+
+    def run(argv, **kwargs):  # noqa: ANN001
+        if "--ping" in argv:
+            ping_started.set()
+            time.sleep(0.2)
+            return _completed(0)
+        return _completed(1, stdout="plugin.py: Eicar-Test-Signature FOUND")
+
+    session = ClamAvSession(enabled=True, which=which, run=run)
+
+    def scan(_: int) -> str:
+        if _:
+            ping_started.wait(timeout=5)
+        return session.scan_bytes(CLEAN_ENGINE_BYTES, filename="demo.py")[1]
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        statuses = list(pool.map(scan, range(6)))
+
+    assert statuses == ["infected"] * 6
+    assert session.backend == "clamdscan"

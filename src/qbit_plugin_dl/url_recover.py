@@ -26,6 +26,26 @@ class GitHubRawRef:
     path: str
 
 
+def _is_unsafe_path_segment(segment: str) -> bool:
+    """Empty, dot, or encoded-separator segments that could change the target repo."""
+    if not segment:
+        return True
+    decoded = unquote(segment)
+    return (
+        decoded in {".", ".."}
+        or "/" in decoded
+        or "\\" in decoded
+        or "%" in decoded
+    )
+
+
+def is_github_raw_host(url: str) -> bool:
+    try:
+        return (urlparse(url.strip()).hostname or "").lower() == _RAW_HOST
+    except ValueError:
+        return False
+
+
 def parse_github_raw_url(url: str) -> GitHubRawRef | None:
     """
     Parse ``raw.githubusercontent.com/{owner}/{repo}/{ref}/path…``.
@@ -40,7 +60,12 @@ def parse_github_raw_url(url: str) -> GitHubRawRef | None:
         return None
     if (parsed.hostname or "").lower() != _RAW_HOST:
         return None
-    parts = [unquote(p) for p in parsed.path.split("/") if p]
+    raw_parts = parsed.path.split("/")[1:]
+    # httpx normalizes dot segments before sending, so ``repo/../../other`` would
+    # be trusted as *repo* but fetched from *other*. Refuse anything ambiguous.
+    if any(_is_unsafe_path_segment(p) for p in raw_parts):
+        return None
+    parts = [unquote(p) for p in raw_parts]
     if len(parts) < 4:
         return None
     owner, repo = parts[0], parts[1]

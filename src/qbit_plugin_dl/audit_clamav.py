@@ -45,31 +45,39 @@ class ClamAvSession:
     # clamscan reloads the full signature DB (~hundreds of MB–1GB+). Never run
     # more than one scan at a time across the install worker's to_thread pool.
     _scan_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    # Install workers scan concurrently; serialize the backend probe so no scan
+    # sees ``_probed`` before ``_backend`` is decided (would skip the scan).
+    _probe_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     @property
     def backend(self) -> BackendName:
         self._ensure_probed()
         return self._backend
 
-    def _ensure_probed(self) -> None:
-        if self._probed:
+    def _ensure_probed(self, *, force: bool = False) -> None:
+        if self._probed and not force:
             return
-        self._probed = True
+        with self._probe_lock:
+            if self._probed and not force:
+                return
+            # Publish the backend before the flag: readers skip the lock once
+            # ``_probed`` is set.
+            self._backend = self._detect_backend()
+            self._probed = True
+
+    def _detect_backend(self) -> BackendName:
         if not self.enabled:
-            self._backend = "none"
-            return
+            return "none"
 
         clamdscan = self.which("clamdscan")
         if clamdscan and self._ping_clamd(clamdscan):
-            self._backend = "clamdscan"
-            return
+            return "clamdscan"
 
         clamscan = self.which("clamscan")
         if clamscan and self.allow_clamscan_fallback is True:
-            self._backend = "clamscan"
-            return
+            return "clamscan"
 
-        self._backend = "none"
+        return "none"
 
     def _ping_clamd(self, clamdscan: str) -> bool:
         # ClamAV 1.0+ requires an attempt count: `clamdscan --ping [A[:I]]`.
@@ -101,13 +109,11 @@ class ClamAvSession:
     def grant_clamscan_fallback(self) -> None:
         self.allow_clamscan_fallback = True
         # Re-probe so backend becomes clamscan if daemon still unavailable.
-        self._probed = False
-        self._ensure_probed()
+        self._ensure_probed(force=True)
 
     def deny_clamscan_fallback(self) -> None:
         self.allow_clamscan_fallback = False
-        self._probed = False
-        self._ensure_probed()
+        self._ensure_probed(force=True)
 
     def scan_bytes(
         self,
