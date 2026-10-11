@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import threading
+import warnings
 from collections import defaultdict
 from importlib.resources import as_file, files
 from pathlib import Path
@@ -775,6 +777,28 @@ def build_clamav_session() -> ClamAvSession:
     )
 
 
+class WorkerCancelled(Exception):
+    """Raised from a progress callback to stop a worker early (app closing)."""
+
+
+class _CancellableWorker(QThread):
+    """QThread with a cooperative cancel flag checked from progress callbacks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def is_cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def _check_cancelled(self) -> None:
+        if self._cancel.is_set():
+            raise WorkerCancelled()
+
+
 class CatalogWorker(QThread):
     finished_ok = Signal(list, str)
     failed = Signal(str)
@@ -792,7 +816,7 @@ class CatalogWorker(QThread):
             self.failed.emit(str(exc))
 
 
-class CategoryWorker(QThread):
+class CategoryWorker(_CancellableWorker):
     progress = Signal(int, int)
     finished_ok = Signal(list)
     failed = Signal(str)
@@ -813,6 +837,7 @@ class CategoryWorker(QThread):
         try:
 
             def on_progress(done: int, total: int, _plugin: Plugin) -> None:
+                self._check_cancelled()
                 self.progress.emit(done, total)
 
             enriched = enrich_plugins(
@@ -822,11 +847,13 @@ class CategoryWorker(QThread):
                 trusted_hosts=self.trusted_hosts,
             )
             self.finished_ok.emit(enriched)
+        except WorkerCancelled:
+            return
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
 
-class InstallWorker(QThread):
+class InstallWorker(_CancellableWorker):
     progress = Signal(int, int, str)
     finished_ok = Signal(list)
     failed = Signal(str)
@@ -860,6 +887,9 @@ class InstallWorker(QThread):
                 plugin: Plugin,
                 result: InstallResult | None,
             ) -> None:
+                # Engine writes are atomic (tmp + replace) and finish before
+                # this callback, so stopping here never leaves a partial file.
+                self._check_cancelled()
                 status = "ok"
                 if result is not None and not result.ok:
                     status = result.error or "error"
@@ -878,11 +908,13 @@ class InstallWorker(QThread):
                 allow_ast_without_clamav=self.allow_ast_without_clamav,
             )
             self.finished_ok.emit(results)
+        except WorkerCancelled:
+            return
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
 
-class UninstallWorker(QThread):
+class UninstallWorker(_CancellableWorker):
     progress = Signal(int, int, str)
     finished_ok = Signal(list)
     failed = Signal(str)
@@ -901,6 +933,7 @@ class UninstallWorker(QThread):
                 filename: str,
                 result: UninstallResult | None,
             ) -> None:
+                self._check_cancelled()
                 status = "ok"
                 if result is not None and not result.ok:
                     status = result.error or "error"
@@ -917,6 +950,8 @@ class UninstallWorker(QThread):
                 on_progress=on_progress,
             )
             self.finished_ok.emit(results)
+        except WorkerCancelled:
+            return
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
@@ -1055,6 +1090,12 @@ class MainWindow(QMainWindow):
         self._install_worker: InstallWorker | None = None
         self._uninstall_worker: UninstallWorker | None = None
         self._update_worker: UpdateCheckWorker | None = None
+        # Set when an update check is requested while one is running (path
+        # change, install finished); a fresh check runs once it ends.
+        self._update_recheck_pending = False
+        # Window close requested while workers run: cancel them, keep the
+        # event loop alive, and close for real once every thread has finished.
+        self._closing = False
         self._force_category_refresh = False
         self._status_base = "Loading catalog…"
         self._status_updates_suffix = ""
@@ -1643,8 +1684,14 @@ class MainWindow(QMainWindow):
         self.update_all_btn.setEnabled(bool(self._updates) and not busy)
 
     def _start_update_check(self) -> None:
-        if self._update_worker and self._update_worker.isRunning():
+        if self._closing:
             return
+        if self._update_worker and self._update_worker.isRunning():
+            # Results of the running check may be for an old directory or
+            # predate an install; re-check once it ends.
+            self._update_recheck_pending = True
+            return
+        self._update_recheck_pending = False
         if not self._all_plugins:
             self._updates = set()
             self._status_updates_suffix = ""
@@ -1667,9 +1714,27 @@ class MainWindow(QMainWindow):
         self._sync_update_all_button(busy=True)
         worker.finished_ok.connect(self._on_updates_checked)
         worker.failed.connect(self._on_updates_failed)
+        worker.finished.connect(self._on_update_worker_done)
         worker.start()
 
+    def _update_result_is_current(self) -> bool:
+        worker = self._update_worker
+        return (
+            not self._update_recheck_pending
+            and worker is not None
+            and worker.engines_dir == self._engines_dir
+        )
+
+    def _on_update_worker_done(self) -> None:
+        if self._update_recheck_pending and not self._closing:
+            self._start_update_check()
+
     def _on_updates_checked(self, outdated: object) -> None:
+        if not self._update_result_is_current():
+            # Stale (directory changed or install finished meanwhile); the
+            # pending re-check will publish fresh results.
+            self._update_recheck_pending = True
+            return
         self._updates = set(outdated) if isinstance(outdated, set) else set()
         count = len(self._updates)
         self._status_updates_suffix = (
@@ -1680,6 +1745,9 @@ class MainWindow(QMainWindow):
         self._sync_update_all_button()
 
     def _on_updates_failed(self, message: str) -> None:
+        if not self._update_result_is_current():
+            self._update_recheck_pending = True
+            return
         self.status_label.setText(f"{self._status_base} — update check failed")
         self._sync_update_all_button()
         if message:
@@ -1725,8 +1793,18 @@ class MainWindow(QMainWindow):
         item: QTreeWidgetItem,
         plugin: Plugin,
     ) -> None:
-        """Uncheck other checked rows that would write the same .py basename."""
+        """Uncheck other checked plugins that would write the same .py basename.
+
+        Works on the full selection, not just visible rows: a checked plugin
+        hidden by filters would otherwise still be installed over this one.
+        """
         target = plugin.filename
+        keep = self._plugin_key(plugin)
+        for other in self._all_plugins:
+            if other.filename == target:
+                other_key = self._plugin_key(other)
+                if other_key != keep:
+                    self._checked.discard(other_key)
         root = self.tree.invisibleRootItem()
         stack = [root.child(i) for i in range(root.childCount())]
         while stack:
@@ -1796,7 +1874,47 @@ class MainWindow(QMainWindow):
         if not plugins:
             QMessageBox.information(self, "Nothing selected", "Select at least one plugin.")
             return
-        self._start_install(plugins)
+        plugins = self._confirm_hidden_selection(plugins)
+        if plugins:
+            self._start_install(plugins)
+
+    def _confirm_hidden_selection(self, plugins: list[Plugin]) -> list[Plugin]:
+        """
+        Ask before installing checked plugins the current filters hide.
+
+        Returns the plugins to install (possibly only visible ones), or an
+        empty list when the user cancels.
+        """
+        visible = {self._plugin_key(p) for p in self._visible_plugins}
+        hidden = [p for p in plugins if self._plugin_key(p) not in visible]
+        if not hidden:
+            return plugins
+        shown = [p for p in plugins if self._plugin_key(p) in visible]
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Hidden selections")
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(
+            f"{len(hidden)} checked plugin(s) are hidden by the current filters:"
+            f"\n\n{_format_name_list([p.name for p in hidden])}"
+        )
+        box.setInformativeText("Install them too, or only the visible selection?")
+        all_btn = box.addButton("Install all", QMessageBox.ButtonRole.AcceptRole)
+        visible_btn = box.addButton(
+            "Visible only", QMessageBox.ButtonRole.AcceptRole
+        )
+        cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+        visible_btn.setEnabled(bool(shown))
+        box.setDefaultButton(visible_btn if shown else cancel_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is all_btn:
+            return plugins
+        if clicked is visible_btn:
+            return shown
+        return []
 
     def uninstall_selected(self) -> None:
         plugins = self._selected_plugins()
@@ -2023,17 +2141,51 @@ class MainWindow(QMainWindow):
         self._set_status("Uninstall error")
         QMessageBox.critical(self, "Uninstall error", message)
 
+    def _all_workers(self) -> list[QThread]:
+        return [
+            worker
+            for worker in (
+                self._catalog_worker,
+                self._category_worker,
+                self._install_worker,
+                self._uninstall_worker,
+                self._update_worker,
+            )
+            if worker is not None
+        ]
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
-        for worker in (
-            self._catalog_worker,
-            self._category_worker,
-            self._install_worker,
-            self._uninstall_worker,
-            self._update_worker,
-        ):
-            if worker is not None and worker.isRunning():
-                worker.wait(10000)
-        super().closeEvent(event)
+        running = [w for w in self._all_workers() if w.isRunning()]
+        if not running:
+            super().closeEvent(event)
+            return
+        # Never let a running QThread be destroyed (Qt aborts the process).
+        # Ask workers to stop at their next checkpoint and close once they do.
+        event.ignore()
+        if self._closing:
+            return
+        self._closing = True
+        self._catalog_refresh_timer.stop()
+        self._set_status("Stopping background tasks before closing…")
+        self.centralWidget().setEnabled(False)
+        for worker in running:
+            for signal in (worker.finished_ok, worker.failed):  # type: ignore[attr-defined]
+                # PySide warns (rather than raises) when nothing is connected.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    try:
+                        signal.disconnect()
+                    except (RuntimeError, TypeError):
+                        pass
+            if isinstance(worker, _CancellableWorker):
+                worker.cancel()
+            worker.finished.connect(self._close_when_workers_done)
+
+    def _close_when_workers_done(self) -> None:
+        if any(w.isRunning() for w in self._all_workers()):
+            return
+        # Defer so the finishing thread's own signal delivery completes first.
+        QTimer.singleShot(0, self.close)
 
 
 def run_app() -> int:

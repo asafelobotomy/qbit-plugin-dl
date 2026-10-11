@@ -856,3 +856,151 @@ def test_read_only_trust_once_does_not_cover_install(tmp_path: Path, monkeypatch
     assert "scare.ca" not in window._declined_download_hosts
     window.close()
     assert app is not None
+
+
+def _quiet_window(tmp_path: Path, monkeypatch, org: str):
+    """MainWindow with no network: the startup catalog refresh is stubbed out."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    from PySide6.QtWidgets import QApplication
+
+    from qbit_plugin_dl.gui import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName(org)
+    app.setApplicationName(org)
+    monkeypatch.setattr(MainWindow, "refresh_catalog", lambda self, **_kw: None)
+    return app, MainWindow()
+
+
+def test_close_with_running_worker_cancels_then_closes(tmp_path: Path, monkeypatch):
+    import time
+
+    from PySide6.QtCore import Signal
+
+    from qbit_plugin_dl.gui import _CancellableWorker
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-close")
+
+    class SlowWorker(_CancellableWorker):
+        finished_ok = Signal(list)
+        failed = Signal(str)
+
+        def run(self) -> None:
+            deadline = time.monotonic() + 10
+            while not self.is_cancelled() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.finished_ok.emit([])
+
+    delivered: list[object] = []
+    worker = SlowWorker()
+    worker.finished_ok.connect(delivered.append)
+    window._install_worker = worker  # type: ignore[assignment]
+    window.show()
+    worker.start()
+
+    started = time.monotonic()
+    assert window.close() is False  # deferred, not blocking
+    assert time.monotonic() - started < 1
+    assert worker.is_cancelled()
+    assert window.isVisible()
+
+    deadline = time.monotonic() + 5
+    while window.isVisible() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    assert not window.isVisible()
+    assert not worker.isRunning()
+    assert delivered == []  # result slots were disconnected while closing
+
+
+def test_stale_update_check_results_are_discarded(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-stale")
+    old_dir, new_dir = tmp_path / "old", tmp_path / "new"
+    window._engines_dir = new_dir
+    window._update_worker = SimpleNamespace(  # type: ignore[assignment]
+        engines_dir=old_dir, isRunning=lambda: True
+    )
+    window._updates = set()
+
+    # A check requested while one runs is queued, not dropped.
+    window._start_update_check()
+    assert window._update_recheck_pending
+
+    window._update_recheck_pending = False
+    window._on_updates_checked({"jackett.py"})
+    assert window._updates == set()
+    assert window._update_recheck_pending
+
+    window._update_recheck_pending = False
+    window._update_worker.engines_dir = new_dir
+    window._on_updates_checked({"jackett.py"})
+    assert window._updates == {"jackett.py"}
+    window._update_worker = None
+    window.close()
+    assert app is not None
+
+
+def test_hidden_checked_plugins_need_confirmation(tmp_path: Path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-hidden")
+    shown = _plugin(name="Shown", download_url="https://example.com/shown.py")
+    hidden = _plugin(
+        name="Hidden", download_url="https://example.com/hidden.py", warning=True
+    )
+    window._all_plugins = [shown, hidden]
+    window._visible_plugins = [shown]
+    window._checked = {window._plugin_key(shown), window._plugin_key(hidden)}
+
+    boxes: list[QMessageBox] = []
+    choice = {"text": "Visible only"}
+    chosen: dict[str, object] = {}
+
+    def fake_exec(self):  # noqa: ANN001
+        boxes.append(self)
+        chosen["btn"] = next(
+            (b for b in self.buttons() if b.text() == choice["text"]), None
+        )
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: chosen.get("btn"))
+
+    selected = window._selected_plugins()
+    assert window._confirm_hidden_selection(selected) == [shown]
+    assert boxes[-1].defaultButton().text() == "Visible only"
+    assert "Hidden" in boxes[-1].text()
+    choice["text"] = "Install all"
+    assert window._confirm_hidden_selection(selected) == [shown, hidden]
+    choice["text"] = "Cancel"
+    assert window._confirm_hidden_selection(selected) == []
+
+    # Nothing hidden: no prompt.
+    count = len(boxes)
+    assert window._confirm_hidden_selection([shown]) == [shown]
+    assert len(boxes) == count
+    window.close()
+    assert app is not None
+
+
+def test_filename_conflict_check_covers_hidden_rows(tmp_path: Path, monkeypatch):
+    from PySide6.QtWidgets import QTreeWidgetItem
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-conflict")
+    mine = _plugin(name="Mine", download_url="https://example.com/a/jackett.py")
+    fork = _plugin(name="Fork", download_url="https://example.com/b/jackett.py")
+    other = _plugin(name="Other", download_url="https://example.com/other.py")
+    window._all_plugins = [mine, fork, other]
+    window._visible_plugins = [mine, other]  # fork hidden by filters
+    window._checked = {window._plugin_key(p) for p in (mine, fork, other)}
+
+    window._uncheck_filename_conflicts(QTreeWidgetItem(), mine)
+
+    assert window._checked == {window._plugin_key(mine), window._plugin_key(other)}
+    window.close()
+    assert app is not None
