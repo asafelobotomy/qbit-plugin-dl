@@ -780,6 +780,11 @@ def build_clamav_session() -> ClamAvSession:
     )
 
 
+# A redirect chain can hop through several unapproved projects; stop asking
+# after this many approve-and-retry rounds for one install batch.
+_MAX_REDIRECT_TRUST_ROUNDS = 3
+
+
 class WorkerCancelled(Exception):
     """Raised from a progress callback to stop a worker early (app closing)."""
 
@@ -1123,6 +1128,9 @@ class MainWindow(QMainWindow):
         # Set when an update check is requested while one is running (path
         # change, install finished); a fresh check runs once it ends.
         self._update_recheck_pending = False
+        self._install_session: ClamAvSession | None = None
+        self._install_carried: list[InstallResult] = []
+        self._install_redirect_round = 0
         # Window close requested while workers run: cancel them, keep the
         # event loop alive, and close for real once every thread has finished.
         self._closing = False
@@ -1485,18 +1493,36 @@ class MainWindow(QMainWindow):
             else:
                 examples.append(label)
 
+        return self._confirm_trust_keys(
+            unknown,
+            title="Untrusted download sources",
+            text=(
+                "Some plugins download from sources that are not on the "
+                "built-in allowlist (qbittorrent/search-plugins and "
+                "LightDestory/qBittorrent-Search-Plugins on "
+                "raw.githubusercontent.com)."
+            ),
+            details=f"Approve to continue this {purpose}:\n\n" + "\n\n".join(examples),
+            required=required,
+        )
+
+    def _confirm_trust_keys(
+        self,
+        keys: list[str],
+        *,
+        title: str,
+        text: str,
+        details: str,
+        required: bool = True,
+    ) -> bool:
+        """Ask Trust once / Always trust / Cancel for *keys*; record the choice."""
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Untrusted download sources")
-        box.setText(
-            "Some plugins download from sources that are not on the "
-            "built-in allowlist (qbittorrent/search-plugins and "
-            "LightDestory/qBittorrent-Search-Plugins on "
-            "raw.githubusercontent.com)."
-        )
-        box.setInformativeText(
-            f"Approve to continue this {purpose}:\n\n" + "\n\n".join(examples)
-        )
+        box.setWindowTitle(title)
+        # Labels and URLs come from the catalog: never let Qt render them as HTML.
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(text)
+        box.setInformativeText(details)
         once_btn = box.addButton("Trust once", QMessageBox.ButtonRole.AcceptRole)
         always_btn = box.addButton("Always trust", QMessageBox.ButtonRole.YesRole)
         cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
@@ -1507,19 +1533,60 @@ class MainWindow(QMainWindow):
         clicked = box.clickedButton()
         if clicked is once_btn:
             if required:
-                self._session_trusted_hosts.update(unknown)
+                self._session_trusted_hosts.update(keys)
             else:
-                self._session_read_trusted_hosts.update(unknown)
-            self._declined_download_hosts.difference_update(unknown)
+                self._session_read_trusted_hosts.update(keys)
+            self._declined_download_hosts.difference_update(keys)
             return True
         if clicked is always_btn:
-            for key in unknown:
+            for key in keys:
                 add_trusted_download_host(key)
-            self._declined_download_hosts.difference_update(unknown)
+            self._declined_download_hosts.difference_update(keys)
             return True
         if not required:
-            self._declined_download_hosts.update(unknown)
+            self._declined_download_hosts.update(keys)
         return not required
+
+    def _prompt_redirect_trust(self, results: list[InstallResult]) -> list[Plugin]:
+        """
+        Ask to approve sources that installs were redirected to.
+
+        Returns the plugins to retry (empty when the user cancels). The catalog
+        URL was already approved; the redirect lands on a different project or
+        host (e.g. a renamed GitLab namespace), which needs its own consent.
+        """
+        trusted = self._effective_trusted_hosts(install=True)
+        keys: list[str] = []
+        lines: list[str] = []
+        retry: list[Plugin] = []
+        for result in results:
+            err = result.untrusted_redirect
+            if err is None:
+                continue
+            retry.append(result.plugin)
+            if err.trust_key in trusted:
+                continue  # approved meanwhile (e.g. by an earlier row)
+            if err.trust_key not in keys:
+                keys.append(err.trust_key)
+            lines.append(
+                f"{result.plugin.name}: {trust_key_label(err.trust_key)}\n"
+                f"  from {result.plugin.download_url}\n"
+                f"  to   {err.blocked_url}"
+            )
+        if not retry:
+            return []
+        if keys and not self._confirm_trust_keys(
+            keys,
+            title="Download redirected",
+            text=(
+                "Some plugins redirected to a different source than the one "
+                "you approved. A redirect can mean the project moved, or that "
+                "the original location now points somewhere else."
+            ),
+            details="Approve the new source and retry?\n\n" + "\n\n".join(lines),
+        ):
+            return []
+        return retry
 
     def _plugin_key(self, plugin: Plugin) -> tuple[str, str]:
         return (plugin.name, plugin.download_url)
@@ -2099,17 +2166,30 @@ class MainWindow(QMainWindow):
             return True
         return False
 
-    def _start_install(self, plugins: list[Plugin]) -> None:
+    def _start_install(
+        self,
+        plugins: list[Plugin],
+        *,
+        session: ClamAvSession | None = None,
+        carried: list[InstallResult] | None = None,
+        redirect_round: int = 0,
+    ) -> None:
         if self._install_worker and self._install_worker.isRunning():
             return
         if self._uninstall_worker and self._uninstall_worker.isRunning():
             return
 
-        session = build_clamav_session()
-        if not self._prompt_clamscan_consent(session):
-            return
+        if redirect_round == 0:
+            session = build_clamav_session()
+            if not self._prompt_clamscan_consent(session):
+                return
         if not self._prompt_untrusted_hosts(plugins):
             return
+        # Retries after a redirect approval reuse the batch's ClamAV choice and
+        # report one combined summary.
+        self._install_session = session
+        self._install_carried = list(carried or [])
+        self._install_redirect_round = redirect_round
 
         self._engines_dir = resolve_install_dir(preferred=self._engines_dir)
         self._set_busy_for_install(True)
@@ -2174,6 +2254,31 @@ class MainWindow(QMainWindow):
         self._set_status(f"[{done}/{total}] {short}")
 
     def _on_install_finished(self, results: list) -> None:
+        carried = self._install_carried
+        self._install_carried = []
+        if self._install_redirect_round < _MAX_REDIRECT_TRUST_ROUNDS:
+            retry = self._prompt_redirect_trust(results)
+            if retry:
+                retry_ids = {id(p) for p in retry}
+                keep = carried + [r for r in results if id(r.plugin) not in retry_ids]
+                worker = self._install_worker
+                if worker is not None:
+                    # finished_ok is emitted from run(); let the thread exit.
+                    worker.wait()
+                self._start_install(
+                    retry,
+                    session=self._install_session,
+                    carried=keep,
+                    redirect_round=self._install_redirect_round + 1,
+                )
+                if self._install_worker is not worker:
+                    return
+                # Retry did not start (e.g. trust prompt cancelled).
+                results = keep + [
+                    r for r in results if id(r.plugin) in retry_ids
+                ]
+                carried = []
+        results = carried + results
         self._set_busy_for_install(False)
         self.progress.setVisible(False)
         ok = sum(1 for r in results if r.ok)

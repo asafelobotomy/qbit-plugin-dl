@@ -1070,3 +1070,87 @@ def test_controls_stay_disabled_while_install_runs(tmp_path: Path, monkeypatch):
     window._install_worker = None
     window.close()
     assert app is not None
+
+
+@pytest.mark.parametrize("choice", ["Trust once", "Cancel"])
+def test_install_redirect_prompt_retries_after_approval(
+    tmp_path: Path, monkeypatch, choice: str
+):
+    """A redirect to an unapproved project asks once, then retries only that plugin."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from qbit_plugin_dl.fetch import FetchError
+    from qbit_plugin_dl.gui import InstallSummaryDialog, MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("qbit-plugin-dl-test-redirect")
+    app.setApplicationName("qbit-plugin-dl-test-redirect")
+    QSettings().remove("security/trusted_download_hosts")
+
+    window = MainWindow()
+    moved = _plugin(
+        name="Moved",
+        download_url="https://gitlab.com/old/p/-/raw/master/moved.py",
+    )
+    fine = _plugin(name="Fine", download_url="https://example.com/fine.py")
+    redirect = FetchError(
+        message="Untrusted project",
+        code="host",
+        host="gitlab.com",
+        blocked_url="https://gitlab.com/new/p/-/raw/master/moved.py",
+        trust_key="gitlab:new/p",
+    )
+    results = [
+        InstallResult(plugin=moved, ok=False, path=None, error="x",
+                      untrusted_redirect=redirect),
+        InstallResult(plugin=fine, ok=True, path=tmp_path / "fine.py"),
+    ]
+    prompts: list[QMessageBox] = []
+    chosen: dict[str, object] = {}
+
+    def fake_exec(self):  # noqa: ANN001
+        prompts.append(self)
+        chosen["btn"] = next(
+            (b for b in self.buttons() if b.text() == choice), None
+        )
+        if chosen["btn"] is None:
+            chosen["btn"] = self.button(QMessageBox.StandardButton.Cancel)
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: chosen.get("btn"))
+    retries: list[tuple] = []
+    sentinel = object()
+
+    def fake_start(plugins, **kwargs):  # noqa: ANN001
+        retries.append((plugins, kwargs))
+        window._install_worker = sentinel  # type: ignore[assignment]
+
+    monkeypatch.setattr(window, "_start_install", fake_start)
+    summaries: list[str] = []
+    monkeypatch.setattr(
+        InstallSummaryDialog, "exec", lambda self: summaries.append(self.windowTitle())
+    )
+    monkeypatch.setattr(window, "_start_update_check", lambda: None)
+
+    window._on_install_finished(results)
+
+    assert len(prompts) == 1
+    box = prompts[0]
+    assert box.defaultButton() is box.escapeButton()
+    assert box.textFormat() == Qt.TextFormat.PlainText
+    assert "gitlab.com/new/p" in box.informativeText()
+    if choice == "Trust once":
+        assert "gitlab:new/p" in window._session_trusted_hosts
+        assert retries and retries[0][0] == [moved]
+        assert retries[0][1]["carried"] == [results[1]]
+        assert retries[0][1]["redirect_round"] == 1
+        assert summaries == []
+    else:
+        assert "gitlab:new/p" not in window._session_trusted_hosts
+        assert retries == []
+        assert len(summaries) == 1

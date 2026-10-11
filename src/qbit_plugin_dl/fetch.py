@@ -86,6 +86,10 @@ class FetchError:
     message: str
     code: str  # https | size | empty | host | private | network | redirect | not_found
     host: str = ""
+    # For ``host`` failures: the hop that was refused and its consent key (empty
+    # when no key can be offered, e.g. a malformed code-hosting path).
+    blocked_url: str = ""
+    trust_key: str = ""
 
 
 def require_https_url(url: str) -> str:
@@ -377,6 +381,17 @@ def check_download_host(
     return None
 
 
+def _host_fetch_error(url: str, message: str) -> FetchError:
+    code = _host_error_code(message)
+    return FetchError(
+        message=message,
+        code=code,
+        host=hostname_from_url(url),
+        blocked_url=url,
+        trust_key=(trust_key_for_url(url) or "") if code == "host" else "",
+    )
+
+
 def _redirect_target(current_url: str, response: httpx.Response) -> str | None:
     if not response.is_redirect:
         return None
@@ -528,11 +543,7 @@ async def _fetch_plugin_bytes_async(
                 resolver=resolver,
             )
             if pre_host_err:
-                return FetchError(
-                    message=pre_host_err,
-                    code=_host_error_code(pre_host_err),
-                    host=hostname_from_url(current),
-                )
+                return _host_fetch_error(current, pre_host_err)
 
             async with client.stream(
                 "GET",
@@ -602,11 +613,7 @@ def fetch_plugin_bytes(
                 resolver=resolver,
             )
             if pre_host_err:
-                return FetchError(
-                    message=pre_host_err,
-                    code=_host_error_code(pre_host_err),
-                    host=hostname_from_url(current),
-                )
+                return _host_fetch_error(current, pre_host_err)
 
             with client.stream(
                 "GET",

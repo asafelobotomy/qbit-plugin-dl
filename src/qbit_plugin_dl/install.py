@@ -180,6 +180,9 @@ class InstallResult:
     audit: AuditReport | None = None
     fix: FixReport | None = None
     provenance_error: str | None = None
+    # Set when the download redirected to a source the user has not approved.
+    # Callers may ask for consent and re-run the install.
+    untrusted_redirect: FetchError | None = None
 
 
 _AST_FIX_KINDS = frozenset(
@@ -425,6 +428,18 @@ async def _fetch_plugin_bytes(
     return result.content, None, None
 
 
+def _untrusted_redirect(
+    error: FetchError | None,
+    plugin: Plugin,
+) -> FetchError | None:
+    """*error* when a redirect hop (not the catalog URL) needs consent."""
+    if error is None or error.code != "host" or not error.trust_key:
+        return None
+    if not error.blocked_url or error.blocked_url == plugin.download_url:
+        return None
+    return error
+
+
 def _write_engine(
     dest: Path,
     content: bytes,
@@ -513,7 +528,7 @@ async def _install_plugin_with_optional_fix(
                 error=str(exc),
             )
 
-        content, fetch_error, _fetch_err = await _fetch_plugin_bytes(
+        content, fetch_error, fetch_err = await _fetch_plugin_bytes(
             client, current, trusted_hosts=trusted_hosts
         )
         if content is None:
@@ -539,6 +554,7 @@ async def _install_plugin_with_optional_fix(
                     tried_urls=tried_urls,
                     final_url=current.download_url,
                 ),
+                untrusted_redirect=_untrusted_redirect(fetch_err, current),
             )
 
         if auto_fix:

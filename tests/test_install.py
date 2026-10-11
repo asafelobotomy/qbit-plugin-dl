@@ -30,7 +30,13 @@ from qbit_plugin_dl.provenance import (
     record_install_provenance,
 )
 from tests.fixtures.engine_stubs import CLEAN_ENGINE_BYTES, engine_source
-from tests.http_fakes import TRUSTED_TEST_HOSTS, AsyncMapClient, AsyncSingleClient
+from tests.http_fakes import (
+    TRUSTED_TEST_HOSTS,
+    AsyncMapClient,
+    AsyncRedirectClient,
+    AsyncSingleClient,
+    FakeStreamResponse,
+)
 
 
 def _plugin(**kwargs) -> Plugin:
@@ -444,3 +450,88 @@ def test_install_survives_corrupt_provenance(tmp_path: Path, monkeypatch):
     assert results[0].ok
     assert results[0].provenance_error is None
     assert load_installed_provenance()["demo.py"]["download_url"] == plugin.download_url
+
+
+def test_redirect_to_unapproved_project_is_flagged_then_installs(
+    tmp_path: Path, monkeypatch
+):
+    """A renamed GitLab namespace redirects to a project that needs its own consent."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    old = "https://gitlab.com/oldname/plugins/-/raw/master/demo.py"
+    new = "https://gitlab.com/newname/plugins/-/raw/master/demo.py"
+    plugin = Plugin(
+        name="Demo",
+        site_url="https://example.com",
+        author="a",
+        author_url="",
+        version="1",
+        last_update="",
+        download_url=old,
+        comments="",
+        visibility=Visibility.PUBLIC,
+        warning=False,
+    )
+
+    def _client() -> AsyncRedirectClient:
+        return AsyncRedirectClient(
+            {
+                old: FakeStreamResponse(
+                    b"", old, status=302, headers={"Location": new}
+                ),
+                new: FakeStreamResponse(CLEAN_ENGINE_BYTES, new),
+            }
+        )
+
+    client = _client()
+    [result] = asyncio.run(
+        install_plugins_async(
+            [plugin],
+            tmp_path / "engines",
+            client=client,  # type: ignore[arg-type]
+            trusted_hosts={"gitlab:oldname/plugins"},
+        )
+    )
+    assert not result.ok
+    assert client.gets == [old]  # new hop refused before any request
+    assert result.untrusted_redirect is not None
+    assert result.untrusted_redirect.trust_key == "gitlab:newname/plugins"
+    assert result.untrusted_redirect.blocked_url == new
+    assert not (tmp_path / "engines" / "demo.py").exists()
+
+    [retry] = asyncio.run(
+        install_plugins_async(
+            [plugin],
+            tmp_path / "engines",
+            client=_client(),  # type: ignore[arg-type]
+            trusted_hosts={"gitlab:oldname/plugins", "gitlab:newname/plugins"},
+        )
+    )
+    assert retry.ok, retry.error
+    assert retry.untrusted_redirect is None
+    assert (tmp_path / "engines" / "demo.py").exists()
+
+
+def test_untrusted_catalog_url_is_not_a_redirect(tmp_path: Path):
+    """Only redirect hops are offered for approval after the fact."""
+    url = "https://gitlab.com/someone/plugins/-/raw/master/demo.py"
+    plugin = Plugin(
+        name="Demo",
+        site_url="https://example.com",
+        author="a",
+        author_url="",
+        version="1",
+        last_update="",
+        download_url=url,
+        comments="",
+        visibility=Visibility.PUBLIC,
+        warning=False,
+    )
+    [result] = asyncio.run(
+        install_plugins_async(
+            [plugin],
+            tmp_path,
+            client=AsyncRedirectClient({}),  # type: ignore[arg-type]
+        )
+    )
+    assert not result.ok
+    assert result.untrusted_redirect is None
