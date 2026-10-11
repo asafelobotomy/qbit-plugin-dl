@@ -14,6 +14,7 @@ import httpx
 
 from qbit_plugin_dl.http_util import IDENTITY_HEADERS, check_identity_encoding
 from qbit_plugin_dl.url_recover import (
+    _is_unsafe_path_segment,
     is_github_raw_host,
     is_http_not_found,
     parse_github_raw_url,
@@ -48,6 +49,26 @@ ALLOWED_DOWNLOAD_HOSTS: frozenset[str] = frozenset(
         GIST_RAW_HOST,
     }
 )
+
+
+# Code-hosting hosts where one hostname serves many unrelated owners. Consent is
+# scoped to ``prefix:owner/project`` and host-level trust never covers them.
+# github.com shares the ``github:`` prefix with raw.githubusercontent.com so a
+# ``/raw/`` link and its redirect target are the same principal.
+_PROJECT_SCOPED_HOSTS: dict[str, str] = {
+    GITHUB_RAW_HOST: "github",
+    "github.com": "github",
+    GIST_RAW_HOST: "gist",
+    "codeberg.org": "codeberg",
+    "gitlab.com": "gitlab",
+}
+
+# Display host for trust keys whose prefix is not ``github:``.
+_TRUST_KEY_HOSTS: dict[str, str] = {
+    "gist": GIST_RAW_HOST,
+    "codeberg": "codeberg.org",
+    "gitlab": "gitlab.com",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,26 +122,64 @@ def github_repo_trust_key(owner: str, repo: str) -> str:
     return f"github:{owner.lower()}/{repo.lower()}"
 
 
+def is_project_scoped_host(url: str) -> bool:
+    """True when *url* is on a code-hosting host trusted per project, not per host."""
+    return hostname_from_url(url) in _PROJECT_SCOPED_HOSTS
+
+
+def _project_trust_key(url: str) -> str | None:
+    """``prefix:owner/project`` for a code-hosting URL, or None when ambiguous."""
+    host = hostname_from_url(url)
+    prefix = _PROJECT_SCOPED_HOSTS[host]
+    if host == GITHUB_RAW_HOST:
+        raw = parse_github_raw_url(url)
+        return github_repo_trust_key(raw.owner, raw.repo) if raw else None
+    segments = urlparse(url.strip()).path.split("/")[1:]
+    # httpx normalizes dot segments before sending, so ``a/b/../../c/d`` would be
+    # trusted as *a/b* but fetched from *c/d*. Refuse anything ambiguous.
+    if any(_is_unsafe_path_segment(s) for s in segments):
+        return None
+    if host == "gitlab.com":
+        # Nested groups: the project path is everything before ``/-/``.
+        if "-" not in segments:
+            return None
+        project = segments[: segments.index("-")]
+    else:
+        project = segments[:2]
+    # Need owner + project and at least one segment after them (the file).
+    if len(project) < 2 or len(segments) <= len(project):
+        return None
+    return f"{prefix}:{'/'.join(project).lower()}"
+
+
 def trust_key_for_url(url: str) -> str | None:
     """
     Trust principal for *url*.
 
-    GitHub raw URLs use ``github:owner/repo`` so consent is repo-scoped.
-    Other hosts (including gist CDN) use the hostname.
+    Code-hosting URLs (GitHub, gist, Codeberg, GitLab) use ``prefix:owner/project``
+    so consent is project-scoped. Other hosts use the hostname.
     """
     try:
         require_https_url(url)
     except ValueError:
         return None
-    raw = parse_github_raw_url(url)
-    if raw is not None:
-        return github_repo_trust_key(raw.owner, raw.repo)
-    if is_github_raw_host(url):
-        # Malformed raw URL (dot segments, encoded separators, …): never offer a
-        # CDN-wide hostname key, which would bypass repo-scoped consent.
-        return None
+    if is_project_scoped_host(url):
+        # Malformed path (dot segments, encoded separators, no project, …):
+        # never offer a host-wide key, which would bypass project-scoped consent.
+        return _project_trust_key(url)
     host = hostname_from_url(url)
     return host or None
+
+
+def trust_key_label(key: str) -> str:
+    """Human-readable form of a trust key for prompts and errors."""
+    prefix, sep, rest = key.partition(":")
+    if not sep:
+        return key
+    if prefix == "github":
+        return rest
+    host = _TRUST_KEY_HOSTS.get(prefix)
+    return f"{host}/{rest}" if host else key
 
 
 def is_allowlisted_github_repo(owner: str, repo: str) -> bool:
@@ -160,9 +219,10 @@ def url_is_trusted(
     """
     True when *url* is allowlisted or covered by caller trust keys.
 
-    *trusted_hosts* may contain hostnames (``codeberg.org``) and/or GitHub repo
-    keys (``github:owner/repo``). Host-level trust of ``raw.githubusercontent.com``
-    does **not** approve arbitrary repos.
+    *trusted_hosts* may contain hostnames (``scare.ca``) and/or project keys
+    (``github:owner/repo``, ``gitlab:group/project``, …). Host-level trust of a
+    code-hosting host (``github.com``, ``gitlab.com``, …) does **not** approve
+    arbitrary projects.
     """
     if is_url_allowlisted(url):
         return True
@@ -172,8 +232,8 @@ def url_is_trusted(
     key = trust_key_for_url(url)
     if key is not None and key in keys:
         return True
-    # Non-GitHub-raw hosts (incl. gist CDN): hostname consent.
-    if is_github_raw_host(url):
+    # Code-hosting hosts are project-scoped only; others take hostname consent.
+    if is_project_scoped_host(url):
         return False
     host = hostname_from_url(url)
     return bool(host) and host in keys
@@ -187,7 +247,7 @@ def untrusted_hosts_in_urls(
     """
     Unique trust keys that need consent for the given URLs.
 
-    Returns ``github:owner/repo`` for non-allowlisted GitHub raw URLs and bare
+    Returns project keys (``github:owner/repo``, …) for code-hosting URLs and bare
     hostnames for other HTTPS hosts.
     """
     seen: set[str] = set()
@@ -284,16 +344,27 @@ def check_download_host(
     if not host:
         return f"Invalid download URL: {url}"
     if not url_is_trusted(url, trusted_hosts):
-        if is_github_raw_host(url) and parse_github_raw_url(url) is None:
+        key = trust_key_for_url(url)
+        if key is None and is_github_raw_host(url):
             return (
                 f"Refusing malformed GitHub raw URL (dot segments or encoded "
                 f"separators): {url}"
             )
-        key = trust_key_for_url(url) or host
+        if key is None and is_project_scoped_host(url):
+            return (
+                f"Refusing code-hosting URL without a clear owner/project "
+                f"path: {url}"
+            )
+        key = key or host
         if key.startswith("github:"):
             return (
-                f"Untrusted GitHub repo: {key.removeprefix('github:')} — "
+                f"Untrusted GitHub repo: {trust_key_label(key)} — "
                 "approve this repository and re-run install"
+            )
+        if ":" in key:
+            return (
+                f"Untrusted project: {trust_key_label(key)} — "
+                "approve this project and re-run install"
             )
         return (
             f"Untrusted download host: {host} — approve this host and re-run install"

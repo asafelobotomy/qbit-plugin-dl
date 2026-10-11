@@ -19,7 +19,9 @@ qbit-plugin-dl --version
 
 - Catalog providers: wiki + `qbittorrent/search-plugins` + `LightDestory/qBittorrent-Search-Plugins` (`sources.default_providers`).
 - Download auto-trust is **repo-scoped** in `fetch.ALLOWED_GITHUB_REPOS` (not CDN-wide).
-- Other GitHub raw repos / hosts need user consent (`github:owner/repo` or hostname keys).
+- Other repos / hosts need user consent. Code-hosting hosts (`github.com`, raw, gist, `codeberg.org`, `gitlab.com`) are
+  **project-scoped** (`github:owner/repo`, `gist:`, `codeberg:`, `gitlab:` keys); host-level trust never covers them.
+  Other hosts use hostname keys.
 - Fetch checks **each redirect hop** before requesting (`follow_redirects=False`).
 
 ## Safety audit

@@ -90,6 +90,39 @@ def test_apply_safe_ast_fixes_multiprocessing_pool_to_dummy():
     assert not after.blocked
 
 
+def test_apply_safe_ast_fixes_keeps_header_comments():
+    """qBittorrent reads ``# VERSION:`` from the file; a rewrite must keep it."""
+    src = (
+        b"#!/usr/bin/env python3\n"
+        b"# -*- coding: latin-1 -*-\n"
+        b"# VERSION: 2.1\n"
+        b"# AUTHORS: someone\n"
+        b"#\n"
+        b"# licence text\n"
+        b"\n"
+        b"import urllib2  # trailing comment\n"
+        b"# body comment\n"
+        b"x = 1\n"
+    )
+    out, kinds = apply_safe_ast_fixes(src, filename="demo.py")
+    assert kinds == [FixKind.PY2_IMPORTS]
+    text = out.decode("utf-8")
+    assert text.startswith(
+        "#!/usr/bin/env python3\n# VERSION: 2.1\n# AUTHORS: someone\n#\n"
+        "# licence text\n"
+    )
+    # Output is UTF-8, so a stale non-UTF-8 coding cookie must not survive.
+    assert "coding" not in text
+    assert "import urllib.request as urllib2" in text
+    assert apply_safe_ast_fixes(out, filename="demo.py") == (out, [])
+
+
+def test_apply_safe_ast_fixes_without_header_comments():
+    out, kinds = apply_safe_ast_fixes(b"import urllib2\n", filename="demo.py")
+    assert kinds == [FixKind.PY2_IMPORTS]
+    assert out == b"import urllib.request as urllib2\n"
+
+
 def test_apply_safe_ast_fixes_noop_when_clean():
     fixed, kinds = apply_safe_ast_fixes(CLEAN_ENGINE_BYTES, filename="demo.py")
     assert kinds == []

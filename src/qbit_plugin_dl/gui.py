@@ -63,6 +63,7 @@ from qbit_plugin_dl.categories import (
 )
 from qbit_plugin_dl.fetch import (
     trust_key_for_url,
+    trust_key_label,
     untrusted_hosts_in_urls,
 )
 from qbit_plugin_dl.fix import FIX_INDICATOR, alternates_from_catalog
@@ -737,7 +738,8 @@ def set_allow_ast_without_clamav_enabled(enabled: bool) -> None:
 def trusted_download_hosts() -> set[str]:
     """Persisted trust keys the user chose to always trust for downloads.
 
-    Keys are hostnames (``codeberg.org``) or GitHub repos (``github:owner/repo``).
+    Keys are hostnames (``scare.ca``) or code-hosting projects
+    (``github:owner/repo``, ``gitlab:group/project``, …).
     """
     raw = _settings().value("security/trusted_download_hosts", [], type=list)
     if not isinstance(raw, list):
@@ -746,7 +748,7 @@ def trusted_download_hosts() -> set[str]:
 
 
 def add_trusted_download_host(host: str) -> None:
-    """Persist a trust key (hostname or ``github:owner/repo``)."""
+    """Persist a trust key (hostname or ``prefix:owner/project``)."""
     host = host.lower().strip()
     if not host:
         return
@@ -1459,8 +1461,8 @@ class MainWindow(QMainWindow):
         """
         Pre-prompt for non-allowlisted trust keys on catalog URLs.
 
-        Trust keys are ``github:owner/repo`` for GitHub raw URLs, or a hostname
-        for other HTTPS downloads. When *required* is True (install), Cancel
+        Trust keys are ``prefix:owner/project`` for code-hosting URLs (GitHub,
+        gist, Codeberg, GitLab), or a hostname for other HTTPS downloads. When *required* is True (install), Cancel
         aborts. When False (categories / updates), Cancel continues without
         trusting new keys.
         """
@@ -1475,11 +1477,7 @@ class MainWindow(QMainWindow):
 
         examples: list[str] = []
         for key in unknown:
-            label = (
-                key.removeprefix("github:")
-                if key.startswith("github:")
-                else key
-            )
+            label = trust_key_label(key)
             for plugin in plugins:
                 if trust_key_for_url(plugin.download_url) == key:
                     examples.append(f"{label}\n  e.g. {plugin.download_url}")

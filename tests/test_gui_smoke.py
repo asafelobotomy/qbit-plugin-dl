@@ -464,8 +464,8 @@ def test_prompt_untrusted_hosts_session_and_decline(tmp_path: Path, monkeypatch)
         lambda self: chosen.get("btn"),
     )
     assert window._prompt_untrusted_hosts([plugin], purpose="install") is True
-    assert "codeberg.org" in window._session_trusted_hosts
-    assert "codeberg.org" not in trusted_download_hosts()
+    assert "codeberg:x/y" in window._session_trusted_hosts
+    assert "codeberg:x/y" not in trusted_download_hosts()
 
     # Declined hosts are not re-prompted (cancel path).
     other = _plugin(download_url="https://scare.ca/dl/qBittorrent/x.py")
@@ -830,8 +830,8 @@ def test_read_only_trust_once_does_not_cover_install(tmp_path: Path, monkeypatch
     assert box.defaultButton() is box.escapeButton()
     assert box.standardButton(box.defaultButton()) == QMessageBox.StandardButton.Cancel
 
-    assert "codeberg.org" in window._effective_trusted_hosts(install=False)
-    assert "codeberg.org" not in window._effective_trusted_hosts(install=True)
+    assert "codeberg:x/y" in window._effective_trusted_hosts(install=False)
+    assert "codeberg:x/y" not in window._effective_trusted_hosts(install=True)
 
     # Read-only approval is reused for the next read-only fetch (no prompt) …
     assert window._prompt_untrusted_hosts(

@@ -24,6 +24,7 @@ from qbit_plugin_dl.fetch import (
     is_allowlisted_host,
     is_url_allowlisted,
     trust_key_for_url,
+    trust_key_label,
     untrusted_hosts_in_urls,
     url_is_trusted,
 )
@@ -369,6 +370,84 @@ def test_dot_segment_raw_urls_never_trusted(url: str):
     assert not url_is_trusted(url, {"github:qbittorrent/search-plugins"})
     message = check_download_host(url, check_private=False)
     assert message is not None and "malformed GitHub raw URL" in message
+
+
+@pytest.mark.parametrize(
+    ("url", "key", "host"),
+    [
+        (
+            "https://github.com/SomeAuthor/Fork/raw/master/engines/x.py",
+            "github:someauthor/fork",
+            "github.com",
+        ),
+        (
+            "https://github.com/SomeAuthor/fork/releases/latest/download/x.py",
+            "github:someauthor/fork",
+            "github.com",
+        ),
+        (
+            "https://gitlab.com/Group/Sub/proj/-/raw/master/x.py",
+            "gitlab:group/sub/proj",
+            "gitlab.com",
+        ),
+        (
+            "https://codeberg.org/someone/plugins/raw/branch/main/yts/yts.py",
+            "codeberg:someone/plugins",
+            "codeberg.org",
+        ),
+        (
+            "https://gist.githubusercontent.com/someone/abc123/raw/def/x.py",
+            "gist:someone/abc123",
+            "gist.githubusercontent.com",
+        ),
+    ],
+)
+def test_code_hosting_trust_is_project_scoped(url: str, key: str, host: str):
+    """Approving one project on a shared forge must not approve the whole host."""
+    assert trust_key_for_url(url) == key
+    assert untrusted_hosts_in_urls([url]) == [key]
+    assert url_is_trusted(url, {key})
+    assert not url_is_trusted(url, {host})
+    other = url.replace(url.split("/")[4], "evil-project", 1)
+    assert not url_is_trusted(other, {key})
+    assert check_download_host(url, trusted_hosts={key}, check_private=False) is None
+    message = check_download_host(url, trusted_hosts={host}, check_private=False)
+    assert message is not None and "Untrusted" in message
+
+
+def test_github_web_and_raw_urls_share_trust_key():
+    """A ``github.com/.../raw/`` link redirects to raw.githubusercontent.com."""
+    web = "https://github.com/a/b/raw/master/x.py"
+    raw = "https://raw.githubusercontent.com/a/b/master/x.py"
+    assert trust_key_for_url(web) == trust_key_for_url(raw) == "github:a/b"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/a/b/../../evil/repo/raw/master/x.py",
+        "https://github.com/a/%2E%2E/raw/master/x.py",
+        "https://github.com/a/b",
+        "https://gitlab.com/group/project/raw/master/x.py",
+        "https://gitlab.com/project/-/raw/master/x.py",
+        "https://codeberg.org/a//raw/x.py",
+    ],
+)
+def test_ambiguous_code_hosting_urls_never_trusted(url: str):
+    assert trust_key_for_url(url) is None
+    assert untrusted_hosts_in_urls([url]) == []
+    host = url.split("/")[2]
+    assert not url_is_trusted(url, {host})
+    message = check_download_host(url, trusted_hosts={host}, check_private=False)
+    assert message is not None and "owner/project" in message
+
+
+def test_trust_key_labels():
+    assert trust_key_label("github:a/b") == "a/b"
+    assert trust_key_label("gitlab:g/p") == "gitlab.com/g/p"
+    assert trust_key_label("codeberg:a/b") == "codeberg.org/a/b"
+    assert trust_key_label("gist:u/id") == "gist.githubusercontent.com/u/id"
+    assert trust_key_label("scare.ca") == "scare.ca"
 
 
 @pytest.mark.parametrize("url", _DOT_SEGMENT_URLS)

@@ -6,6 +6,7 @@ Never exec/import plugin bodies. ClamAV must run on bytes before any rewrite.
 from __future__ import annotations
 
 import ast
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -15,6 +16,9 @@ from qbit_plugin_dl.audit_clamav import ClamAvSession
 from qbit_plugin_dl.catalog import Plugin, group_plugins_for_display, plugin_preference_score
 
 FIX_INDICATOR = "🔧 "
+
+# PEP 263 encoding declaration (only honoured on the first two lines).
+_CODING_COOKIE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*[-\w.]+")
 
 # Py2 module root → Python 3 module path
 _PY2_MODULE_MAP: dict[str, str] = {
@@ -237,6 +241,29 @@ def clamav_allows_ast(
     return False
 
 
+def _leading_comment_block(text: str) -> str:
+    """
+    Header comments that ``ast.unparse`` would drop.
+
+    qBittorrent reads ``# VERSION:`` from the file, so the shebang / version /
+    author / licence block before the first statement must survive a rewrite.
+    Encoding cookies are dropped because rewritten output is always UTF-8.
+    """
+    kept: list[str] = []
+    for index, line in enumerate(text.splitlines()):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            break
+        if index < 2 and _CODING_COOKIE.match(line):
+            continue
+        kept.append(line.rstrip())
+    while kept and not kept[-1]:
+        kept.pop()
+    while kept and not kept[0]:
+        kept.pop(0)
+    return "\n".join(kept) + "\n" if kept else ""
+
+
 def apply_safe_ast_fixes(
     content: bytes,
     *,
@@ -277,6 +304,7 @@ def apply_safe_ast_fixes(
     # Preserve a trailing newline like typical source files.
     if not rewritten.endswith("\n"):
         rewritten += "\n"
+    rewritten = _leading_comment_block(text) + rewritten
     return rewritten.encode("utf-8"), list(kinds)
 
 
