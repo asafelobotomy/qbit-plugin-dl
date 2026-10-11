@@ -7,6 +7,8 @@ import io
 import secrets
 import zipfile
 
+import pytest
+
 from qbit_plugin_dl.audit import audit_plugin_bytes, audit_plugin_static
 from tests.fixtures.engine_stubs import CLEAN_ENGINE_BYTES, engine_source
 
@@ -24,12 +26,14 @@ def test_exec_blocked():
     assert any(f.code == "DYN_EXEC" for f in report.fail_findings)
 
 
-def test_dangerous_builtin_reference_warned():
+def test_dangerous_builtin_reference_blocked():
+    # An alias hides the later call from the DYN_EXEC check, so the bare
+    # reference itself must block.
     src = engine_source(body="handler = eval\n")
     report = audit_plugin_static(src.encode(), filename="demo.py")
-    assert not report.blocked
-    assert any(f.code == "BUILTIN_REF" for f in report.findings)
-    assert any("eval" in f.message for f in report.findings)
+    assert report.blocked
+    assert any(f.code == "BUILTIN_REF" for f in report.fail_findings)
+    assert any("eval" in f.message for f in report.fail_findings)
 
 
 def test_os_system_blocked():
@@ -295,3 +299,77 @@ def test_operator_attrgetter_system_blocked():
     report = audit_plugin_static(src.encode(), filename="demo.py")
     assert report.blocked
     assert any(f.code == "DYN_ATTR" for f in report.fail_findings)
+
+
+_ALIAS_BYPASSES = {
+    "builtin_alias": ("", "run = eval\n        run('1')"),
+    "builtin_alias_exec": ("", "f = [exec][0]\n        f('1')"),
+    "os_attr_alias": ("import os\n", "sink = os.system\n        sink('id')"),
+    "os_attr_partial": (
+        "import os\nimport functools\n",
+        "functools.partial(os.system, 'id')()",
+    ),
+    "import_as_alias": ("import os as o\n", "o.system('id')"),
+    "from_import_alias": ("from os import system as s\n", "s('id')"),
+    "from_import_ref": ("from os import popen\n", "x = popen\n        x('id')"),
+    "module_value": ("import os\n", "m = os\n        m.system('id')"),
+    "getattr_concat": ("import os\n", "getattr(os, 'sy' + 'stem')('id')"),
+    "getattr_fstring": ("import os\n", "getattr(os, f\"sys{'tem'}\")('id')"),
+    "getattr_join": ("import os\n", "getattr(os, ''.join(['sys', 'tem']))('id')"),
+    "getattr_runtime_name": ("import os\n", "getattr(os, what)('id')"),
+    "attrgetter_concat": (
+        "import operator\nimport os\n",
+        "operator.attrgetter('sy' + 'stem')(os)('id')",
+    ),
+    "builtins_import_chain": ("", "__builtins__.__import__('os').system('id')"),
+    "builtins_value": ("", "b = __builtins__\n        b.eval('1')"),
+    "sys_modules_lookup": ("import sys\n", "sys.modules['os'].system('id')"),
+    "sys_modules_get": ("import sys\n", "sys.modules.get('os').system('id')"),
+    "process_pool_alias": (
+        "import concurrent.futures as cf\n",
+        "pool = cf.ProcessPoolExecutor\n        pool()",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_ALIAS_BYPASSES))
+def test_aliased_dangerous_callables_blocked(case: str):
+    extra_imports, body = _ALIAS_BYPASSES[case]
+    src = engine_source(
+        extra_imports=extra_imports,
+        body=f"{body}\n        prettyPrinter({{'name': what}})",
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert report.blocked, report.findings
+
+
+_LEGIT_PATTERNS = {
+    "os_path": ("import os\n", "os.path.join('a', what)"),
+    "import_os_path": ("import os.path\n", "os.path.exists(what)"),
+    "from_os_path": ("from os import path\n", "path.join('a', what)"),
+    "os_environ": ("import os\n", "os.environ.get('HOME')"),
+    "re_compile": ("import re\n", "re.compile(what).search(what)"),
+    "getattr_self": ("", "getattr(self, 'url')"),
+    "getattr_self_runtime": ("", "getattr(self, 'parse_' + cat, None)"),
+    "getattr_os_constant": ("import os\n", "getattr(os, 'sep')"),
+    "sys_modules_membership": ("import sys\n", "'json' in sys.modules"),
+    "thread_pool": (
+        "from concurrent.futures import ThreadPoolExecutor\n",
+        "pool = ThreadPoolExecutor\n        pool(max_workers=2)",
+    ),
+    "multiprocessing_dummy": (
+        "from multiprocessing.dummy import Pool\n",
+        "Pool(4).map(len, [what])",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_LEGIT_PATTERNS))
+def test_common_engine_patterns_not_blocked(case: str):
+    extra_imports, body = _LEGIT_PATTERNS[case]
+    src = engine_source(
+        extra_imports=extra_imports,
+        body=f"{body}\n        prettyPrinter({{'name': what}})",
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert not report.blocked, report.fail_findings

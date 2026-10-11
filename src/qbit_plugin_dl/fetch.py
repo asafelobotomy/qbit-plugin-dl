@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
+import time
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from qbit_plugin_dl.http_util import IDENTITY_HEADERS, check_identity_encoding
 from qbit_plugin_dl.url_recover import (
+    is_github_raw_host,
     is_http_not_found,
     parse_github_raw_url,
     recover_github_raw_url,
@@ -20,6 +24,9 @@ from qbit_plugin_dl.url_recover import (
 # Keep in sync with install / categories / updates callers.
 MAX_PLUGIN_BYTES = 10 * 1024 * 1024
 MAX_REDIRECTS = 5
+# Wall-clock cap per plugin download. httpx timeouts are per operation, so a
+# server trickling one byte per read could otherwise hold a slot indefinitely.
+DOWNLOAD_DEADLINE_S = 120.0
 
 GITHUB_RAW_HOST = "raw.githubusercontent.com"
 GIST_RAW_HOST = "gist.githubusercontent.com"
@@ -61,12 +68,24 @@ class FetchError:
 
 
 def require_https_url(url: str) -> str:
-    """Reject non-HTTPS download URLs."""
+    """Reject non-HTTPS download URLs, non-default ports and trailing-dot hosts."""
     parsed = urlparse(url)
     if parsed.scheme.lower() != "https":
         raise ValueError(f"HTTPS required for plugin downloads: {url}")
     if not parsed.netloc:
         raise ValueError(f"Invalid download URL: {url}")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid download URL: {url}") from exc
+    # Trust keys are per host (or per GitHub repo): a custom port could be a
+    # different service on an approved host.
+    if port not in (None, 443):
+        raise ValueError(f"Non-default port not allowed for downloads: {url}")
+    # ``raw.githubusercontent.com.`` resolves like the real host but would get
+    # its own (CDN-wide) consent key, sidestepping repo-scoped trust.
+    if (parsed.hostname or "").endswith("."):
+        raise ValueError(f"Trailing-dot hostname not allowed: {url}")
     return url
 
 
@@ -96,6 +115,10 @@ def trust_key_for_url(url: str) -> str | None:
     raw = parse_github_raw_url(url)
     if raw is not None:
         return github_repo_trust_key(raw.owner, raw.repo)
+    if is_github_raw_host(url):
+        # Malformed raw URL (dot segments, encoded separators, …): never offer a
+        # CDN-wide hostname key, which would bypass repo-scoped consent.
+        return None
     host = hostname_from_url(url)
     return host or None
 
@@ -150,8 +173,7 @@ def url_is_trusted(
     if key is not None and key in keys:
         return True
     # Non-GitHub-raw hosts (incl. gist CDN): hostname consent.
-    raw = parse_github_raw_url(url)
-    if raw is not None:
+    if is_github_raw_host(url):
         return False
     host = hostname_from_url(url)
     return bool(host) and host in keys
@@ -191,7 +213,10 @@ def _is_blocked_ip(addr: str) -> bool:
     except ValueError:
         return False
     return bool(
-        ip.is_private
+        # Not globally routable: also covers carrier-grade NAT (100.64.0.0/10)
+        # and other special-use ranges that is_private does not.
+        not ip.is_global
+        or ip.is_private
         or ip.is_loopback
         or ip.is_link_local
         or ip.is_multicast
@@ -259,6 +284,11 @@ def check_download_host(
     if not host:
         return f"Invalid download URL: {url}"
     if not url_is_trusted(url, trusted_hosts):
+        if is_github_raw_host(url) and parse_github_raw_url(url) is None:
+            return (
+                f"Refusing malformed GitHub raw URL (dot segments or encoded "
+                f"separators): {url}"
+            )
         key = trust_key_for_url(url) or host
         if key.startswith("github:"):
             return (
@@ -285,18 +315,19 @@ def _redirect_target(current_url: str, response: httpx.Response) -> str | None:
     return urljoin(current_url, location)
 
 
-def _read_limited_body(
-    response: httpx.Response,
-    *,
-    max_bytes: int,
-    iter_chunks: Callable[[], Iterable[bytes]],
-) -> FetchResult | FetchError:
-    final_url = str(response.url)
+def _check_body_headers(
+    response: httpx.Response, *, max_bytes: int
+) -> FetchError | None:
+    """Final-URL, encoding and declared-size checks before reading the body."""
     try:
-        require_https_url(final_url)
+        require_https_url(str(response.url))
     except ValueError as exc:
         return FetchError(message=str(exc), code="https")
-
+    problem = check_identity_encoding(response)
+    if problem:
+        # A compressed body would be inflated chunk-by-chunk by httpx before
+        # the size cap could see it (decompression bomb).
+        return FetchError(message=problem, code="size")
     cl = response.headers.get("Content-Length")
     if cl is not None:
         try:
@@ -310,26 +341,65 @@ def _read_limited_body(
                 )
         except ValueError:
             pass
+    return None
 
-    chunks: list[bytes] = []
-    total = 0
-    for chunk in iter_chunks():
+
+class _BodyAccumulator:
+    """Collect body chunks under a byte cap and an overall deadline."""
+
+    def __init__(self, *, max_bytes: int, deadline: float) -> None:
+        self.max_bytes = max_bytes
+        self.deadline = deadline
+        self.total = 0
+        self.chunks: list[bytes] = []
+
+    def add(self, chunk: bytes) -> FetchError | None:
+        if time.monotonic() > self.deadline:
+            return _deadline_error()
         if not chunk:
-            continue
-        total += len(chunk)
-        if total > max_bytes:
+            return None
+        self.total += len(chunk)
+        if self.total > self.max_bytes:
             return FetchError(
                 message=(
-                    f"Response too large ({total} bytes > "
-                    f"{max_bytes} bytes limit)"
+                    f"Response too large ({self.total} bytes > "
+                    f"{self.max_bytes} bytes limit)"
                 ),
                 code="size",
             )
-        chunks.append(chunk)
-    content = b"".join(chunks)
-    if not content.strip():
-        return FetchError(message="Empty response", code="empty")
-    return FetchResult(content=content, final_url=final_url)
+        self.chunks.append(chunk)
+        return None
+
+    def result(self, final_url: str) -> FetchResult | FetchError:
+        content = b"".join(self.chunks)
+        if not content.strip():
+            return FetchError(message="Empty response", code="empty")
+        return FetchResult(content=content, final_url=final_url)
+
+
+def _deadline_error() -> FetchError:
+    return FetchError(
+        message=f"Download exceeded {DOWNLOAD_DEADLINE_S:.0f}s overall limit",
+        code="network",
+    )
+
+
+def _read_limited_body(
+    response: httpx.Response,
+    *,
+    max_bytes: int,
+    iter_chunks: Callable[[], Iterable[bytes]],
+    deadline: float,
+) -> FetchResult | FetchError:
+    problem = _check_body_headers(response, max_bytes=max_bytes)
+    if problem:
+        return problem
+    body = _BodyAccumulator(max_bytes=max_bytes, deadline=deadline)
+    for chunk in iter_chunks():
+        error = body.add(chunk)
+        if error:
+            return error
+    return body.result(str(response.url))
 
 
 async def fetch_plugin_bytes_async(
@@ -346,6 +416,32 @@ async def fetch_plugin_bytes_async(
 
     Redirect hops are checked **before** each request (SSRF defense).
     """
+    deadline = time.monotonic() + DOWNLOAD_DEADLINE_S
+    try:
+        async with asyncio.timeout(DOWNLOAD_DEADLINE_S):
+            return await _fetch_plugin_bytes_async(
+                client,
+                url,
+                max_bytes=max_bytes,
+                trusted_hosts=trusted_hosts,
+                check_private=check_private,
+                resolver=resolver,
+                deadline=deadline,
+            )
+    except TimeoutError:
+        return _deadline_error()
+
+
+async def _fetch_plugin_bytes_async(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    max_bytes: int,
+    trusted_hosts: Collection[str] | None,
+    check_private: bool,
+    resolver: Callable[..., list] | None,
+    deadline: float,
+) -> FetchResult | FetchError:
     current = url
     try:
         for _hop in range(MAX_REDIRECTS + 1):
@@ -368,11 +464,14 @@ async def fetch_plugin_bytes_async(
                 )
 
             async with client.stream(
-                "GET", current, follow_redirects=False
+                "GET",
+                current,
+                headers=IDENTITY_HEADERS,
+                follow_redirects=False,
             ) as response:
                 target = _redirect_target(current, response)
                 if target is not None:
-                    # Drain / close without reading body; advance to next hop.
+                    # Close without reading body; advance to next hop.
                     current = target
                     continue
 
@@ -381,50 +480,16 @@ async def fetch_plugin_bytes_async(
                         message="Redirect without Location header",
                         code="redirect",
                     )
-                if len(response.history) > MAX_REDIRECTS:
-                    return FetchError(
-                        message=f"Too many redirects (>{MAX_REDIRECTS})",
-                        code="redirect",
-                    )
                 response.raise_for_status()
-                final_url = str(response.url)
-                try:
-                    require_https_url(final_url)
-                except ValueError as exc:
-                    return FetchError(message=str(exc), code="https")
-
-                chunks: list[bytes] = []
-                total = 0
-                cl = response.headers.get("Content-Length")
-                if cl is not None:
-                    try:
-                        if int(cl) > max_bytes:
-                            return FetchError(
-                                message=(
-                                    f"Response too large ({int(cl)} bytes > "
-                                    f"{max_bytes} bytes limit)"
-                                ),
-                                code="size",
-                            )
-                    except ValueError:
-                        pass
+                problem = _check_body_headers(response, max_bytes=max_bytes)
+                if problem:
+                    return problem
+                body = _BodyAccumulator(max_bytes=max_bytes, deadline=deadline)
                 async for chunk in response.aiter_bytes():
-                    if not chunk:
-                        continue
-                    total += len(chunk)
-                    if total > max_bytes:
-                        return FetchError(
-                            message=(
-                                f"Response too large ({total} bytes > "
-                                f"{max_bytes} bytes limit)"
-                            ),
-                            code="size",
-                        )
-                    chunks.append(chunk)
-                content = b"".join(chunks)
-                if not content.strip():
-                    return FetchError(message="Empty response", code="empty")
-                return FetchResult(content=content, final_url=final_url)
+                    error = body.add(chunk)
+                    if error:
+                        return error
+                return body.result(str(response.url))
 
         return FetchError(
             message=f"Too many redirects (>{MAX_REDIRECTS})",
@@ -449,8 +514,11 @@ def fetch_plugin_bytes(
 ) -> FetchResult | FetchError:
     """Synchronous variant of :func:`fetch_plugin_bytes_async`."""
     current = url
+    deadline = time.monotonic() + DOWNLOAD_DEADLINE_S
     try:
         for _hop in range(MAX_REDIRECTS + 1):
+            if time.monotonic() > deadline:
+                return _deadline_error()
             try:
                 require_https_url(current)
             except ValueError as exc:
@@ -469,7 +537,12 @@ def fetch_plugin_bytes(
                     host=hostname_from_url(current),
                 )
 
-            with client.stream("GET", current, follow_redirects=False) as response:
+            with client.stream(
+                "GET",
+                current,
+                headers=IDENTITY_HEADERS,
+                follow_redirects=False,
+            ) as response:
                 target = _redirect_target(current, response)
                 if target is not None:
                     current = target
@@ -485,6 +558,7 @@ def fetch_plugin_bytes(
                     response,
                     max_bytes=max_bytes,
                     iter_chunks=response.iter_bytes,
+                    deadline=deadline,
                 )
                 return result
 

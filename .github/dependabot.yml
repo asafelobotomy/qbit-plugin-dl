@@ -1,0 +1,13 @@
+# Keeps SHA-pinned GitHub Actions current (bumps the hash and its comment).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Let new releases age a week before adopting them (supply-chain buffer).
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]

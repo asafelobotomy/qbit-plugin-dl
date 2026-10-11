@@ -1,0 +1,8 @@
+# AppImage build tooling (scripts/build-appimage.sh). Regenerate the lock with:
+#   uv pip compile requirements/build.in --generate-hashes --universal \
+#     --python-version 3.11 -o requirements/build.lock.txt
+python-appimage==1.4.6
+build
+setuptools>=77
+wheel
+Pillow

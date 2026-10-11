@@ -75,6 +75,9 @@ On first launch you must **Accept** the safety notice (persisted via Qt settings
 
 ```bash
 sha256sum -c SHA256SUMS.txt
+# Provenance: proves the file was built by this repo's release workflow
+# (the checksum file alone only detects corrupted downloads).
+gh attestation verify qbit-plugin-dl-x86_64.AppImage --repo asafelobotomy/qbit-plugin-dl
 ```
 
 3. Make it executable and run:
@@ -160,9 +163,20 @@ chmod +x scripts/sync-icons.sh scripts/build-appimage.sh
 ./scripts/build-appimage.sh
 ```
 
-Builds a wheel, syncs icons, generates `appimage/requirements.txt`, runs [`python-appimage`](https://github.com/niess/python-appimage), then injects `libxcb-cursor` into `PySide6/Qt/lib` and repacks. Override the bundled Python with `PYTHON_VERSION=3.12` (default).
+Builds a wheel, syncs icons, downloads the runtime wheels listed in `requirements/runtime.lock.txt` (hash-verified, exported from `uv.lock`), runs [`python-appimage`](https://github.com/niess/python-appimage) with no package index, then injects `libxcb-cursor` into `PySide6/Qt/lib` and repacks. Build tooling comes from `requirements/build.lock.txt`; the base Python image, `appimagetool`, `patchelf` and the AppImage excludelist are pinned by SHA-256 at the top of `scripts/build-appimage.sh` (x86_64 only). The upstream base image is replaced on each Python patch release, so expect to bump `BASE_IMAGE_URL` / `BASE_IMAGE_SHA256` when its old asset disappears.
 
 `APPIMAGE_EXTRACT_AND_RUN=1` is set so `appimagetool` works without FUSE. The result is `qbit-plugin-dl-x86_64.AppImage` (~200+ MB because of Qt).
+
+### Updating dependencies
+
+After changing dependencies in `pyproject.toml`, refresh the lock and its hashed exports (CI fails if they drift):
+
+```bash
+uv lock
+uv export --frozen --no-dev --no-emit-project -o requirements/runtime.lock.txt
+uv export --frozen --extra dev --no-emit-project -o requirements/dev.lock.txt
+```
+
 ## Tests
 
 ```bash
@@ -173,9 +187,9 @@ GUI smoke tests need an offscreen Qt platform (CI sets this). Plain `pytest` oft
 
 ## Releases
 
-GitHub Actions publishes a release when `pyproject.toml` / `__init__.py` version is bumped on `main` (and AppStream lists the same version). The workflow builds the AppImage, attaches `SHA256SUMS.txt`, and writes release notes from commits since the previous tag (plus GitHub’s generated changelog).
+GitHub Actions publishes a release from `main` whenever the `pyproject.toml` / `__init__.py` version has no `v<version>` tag yet (and AppStream lists the same version). A read-only job builds and tests the AppImage; a separate job with write access attests build provenance, attaches `SHA256SUMS.txt`, and writes release notes from commits since the previous tag (plus GitHub’s generated changelog).
 
-You can also run **Actions → Release → Run workflow** with **force** to publish the current version if its tag does not exist yet.
+**Actions → Release → Run workflow** retries the same check on `main`, e.g. after a failed publish.
 
 ## Catalog sources
 

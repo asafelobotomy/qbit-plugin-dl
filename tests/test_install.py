@@ -30,7 +30,7 @@ from qbit_plugin_dl.provenance import (
     record_install_provenance,
 )
 from tests.fixtures.engine_stubs import CLEAN_ENGINE_BYTES, engine_source
-from tests.http_fakes import TRUSTED_TEST_HOSTS, AsyncSingleClient
+from tests.http_fakes import TRUSTED_TEST_HOSTS, AsyncMapClient, AsyncSingleClient
 
 
 def _plugin(**kwargs) -> Plugin:
@@ -92,13 +92,41 @@ def test_engine_dir_labels(tmp_path: Path, monkeypatch):
     )
 
 
-def test_validate_plugin_filename_ok():
-    assert validate_plugin_filename("engine.py") == "engine.py"
+@pytest.mark.parametrize(
+    "name", ["engine.py", "jackett.py", "x1337x.py", "Rutracker_v2.py", "e" * 64 + ".py"]
+)
+def test_validate_plugin_filename_ok(name: str):
+    assert validate_plugin_filename(name) == name
 
 
 @pytest.mark.parametrize(
     "name",
-    ["", "..", "../x.py", "a/b.py", "a\\b.py", "nope.txt", "."],
+    [
+        "",
+        "..",
+        "../x.py",
+        "a/b.py",
+        "a\\b.py",
+        "nope.txt",
+        ".",
+        "__init__.py",
+        "_private.py",
+        ".py",
+        ".hidden.py",
+        "*.py",
+        "[a-z]*.py",
+        "a b.py",
+        "a\nb.py",
+        "a\u202e.py",
+        "ｅｎｇｉｎｅ.py",
+        "-rf.py",
+        "1337x.py",
+        "e" * 65 + ".py",
+        "helpers.py",
+        "novaprinter.py",
+        "Nova2.py",
+        "socks.py",
+    ],
 )
 def test_validate_plugin_filename_rejects(name: str):
     with pytest.raises(ValueError):
@@ -336,3 +364,83 @@ def test_uninstall_rejects_path_trick(tmp_path: Path):
     assert "basename" in (result.error or "").lower() or "Invalid" in (
         result.error or ""
     )
+
+
+def test_write_error_fails_only_that_plugin(tmp_path: Path, monkeypatch):
+    """A write error (disk full, read-only dir, …) must not abort the batch."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    engines = tmp_path / "engines"
+    good = _plugin()
+    other = _plugin(download_url="https://example.com/other.py")
+    blocked = _plugin(download_url="https://example.com/blocked.py")
+    # os.replace onto an existing directory raises IsADirectoryError.
+    (engines / "blocked.py").mkdir(parents=True)
+    plugins = [blocked, good, other]
+    client = AsyncMapClient({p.download_url: CLEAN_ENGINE_BYTES for p in plugins})
+
+    results = asyncio.run(
+        install_plugins_async(
+            plugins,
+            engines,
+            client=client,  # type: ignore[arg-type]
+            trusted_hosts=TRUSTED_TEST_HOSTS,
+        )
+    )
+
+    by_name = {r.plugin.filename: r for r in results}
+    assert not by_name[blocked.filename].ok
+    assert "Could not write" in (by_name[blocked.filename].error or "")
+    assert by_name["demo.py"].ok and by_name["other.py"].ok
+    assert (engines / "demo.py").is_file() and (engines / "other.py").is_file()
+    assert list(engines.glob("*.tmp")) == []
+
+
+def test_unexpected_error_isolated_to_one_plugin(tmp_path: Path, monkeypatch):
+    import qbit_plugin_dl.install as install_mod
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    engines = tmp_path / "engines"
+    good = _plugin()
+    bad = _plugin(download_url="https://example.com/bad.py")
+    real_write = install_mod._write_engine
+
+    def flaky_write(dest, content, plugin, **kwargs):  # noqa: ANN001
+        if plugin.filename == "bad.py":
+            raise RuntimeError("boom")
+        return real_write(dest, content, plugin, **kwargs)
+
+    monkeypatch.setattr(install_mod, "_write_engine", flaky_write)
+    client = AsyncMapClient(
+        {good.download_url: CLEAN_ENGINE_BYTES, bad.download_url: CLEAN_ENGINE_BYTES}
+    )
+    results = asyncio.run(
+        install_plugins_async(
+            [bad, good],
+            engines,
+            client=client,  # type: ignore[arg-type]
+            trusted_hosts=TRUSTED_TEST_HOSTS,
+        )
+    )
+    assert [r.ok for r in results] == [False, True]
+    assert "boom" in (results[0].error or "")
+
+
+def test_install_survives_corrupt_provenance(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    sidecar = tmp_path / "cache" / "qbit-plugin-dl" / "installed.json"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_bytes(b"\xff\xfe not json")
+    plugin = _plugin()
+    results = asyncio.run(
+        install_plugins_async(
+            [plugin],
+            tmp_path / "engines",
+            client=AsyncSingleClient(  # type: ignore[arg-type]
+                CLEAN_ENGINE_BYTES, plugin.download_url
+            ),
+            trusted_hosts=TRUSTED_TEST_HOSTS,
+        )
+    )
+    assert results[0].ok
+    assert results[0].provenance_error is None
+    assert load_installed_provenance()["demo.py"]["download_url"] == plugin.download_url

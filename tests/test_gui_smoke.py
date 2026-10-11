@@ -789,3 +789,284 @@ def test_plugin_tree_item_sort_toggle_offscreen():
     tree.sortItems(COL_NAME, Qt.SortOrder.DescendingOrder)
     assert tree.topLevelItem(0).text(COL_NAME) == "Zed"
     assert app is not None
+
+
+def test_read_only_trust_once_does_not_cover_install(tmp_path: Path, monkeypatch):
+    """Trust once for a category/update fetch must not approve installs."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from qbit_plugin_dl.gui import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("qbit-plugin-dl-test-trust-scope")
+    app.setApplicationName("qbit-plugin-dl-test-trust-scope")
+    QSettings().remove("security/trusted_download_hosts")
+
+    window = MainWindow()
+    plugin = _plugin(download_url="https://codeberg.org/x/y/raw/branch/main/yts.py")
+    prompts: list[QMessageBox] = []
+    choice = {"text": "Trust once"}
+    chosen: dict[str, object] = {}
+
+    def fake_exec(self):  # noqa: ANN001
+        prompts.append(self)
+        chosen["btn"] = next(
+            (b for b in self.buttons() if b.text() == choice["text"]), None
+        )
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: chosen.get("btn"))
+
+    # Enter/Escape default to Cancel, never to a trust button.
+    assert window._prompt_untrusted_hosts(
+        [plugin], purpose="category resolve", required=False
+    )
+    box = prompts[-1]
+    assert box.defaultButton() is box.escapeButton()
+    assert box.standardButton(box.defaultButton()) == QMessageBox.StandardButton.Cancel
+
+    assert "codeberg.org" in window._effective_trusted_hosts(install=False)
+    assert "codeberg.org" not in window._effective_trusted_hosts(install=True)
+
+    # Read-only approval is reused for the next read-only fetch (no prompt) …
+    assert window._prompt_untrusted_hosts(
+        [plugin], purpose="update check", required=False
+    )
+    assert len(prompts) == 1
+    # … but installing still asks.
+    choice["text"] = "Cancel"
+    assert window._prompt_untrusted_hosts([plugin], purpose="install") is False
+    assert len(prompts) == 2
+
+    # A source declined for a read-only fetch can still be approved for install.
+    other = _plugin(download_url="https://scare.ca/dl/qBittorrent/x.py")
+    assert window._prompt_untrusted_hosts(
+        [other], purpose="category resolve", required=False
+    )
+    assert "scare.ca" in window._declined_download_hosts
+    choice["text"] = "Trust once"
+    assert window._prompt_untrusted_hosts([other], purpose="install") is True
+    assert len(prompts) == 4
+    assert "scare.ca" in window._effective_trusted_hosts(install=True)
+    assert "scare.ca" not in window._declined_download_hosts
+    window.close()
+    assert app is not None
+
+
+def _quiet_window(tmp_path: Path, monkeypatch, org: str):
+    """MainWindow with no network: the startup catalog refresh is stubbed out."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    from PySide6.QtWidgets import QApplication
+
+    from qbit_plugin_dl.gui import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName(org)
+    app.setApplicationName(org)
+    monkeypatch.setattr(MainWindow, "refresh_catalog", lambda self, **_kw: None)
+    return app, MainWindow()
+
+
+def test_close_with_running_worker_cancels_then_closes(tmp_path: Path, monkeypatch):
+    import time
+
+    from PySide6.QtCore import Signal
+
+    from qbit_plugin_dl.gui import _CancellableWorker
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-close")
+
+    class SlowWorker(_CancellableWorker):
+        finished_ok = Signal(list)
+        failed = Signal(str)
+
+        def run(self) -> None:
+            deadline = time.monotonic() + 10
+            while not self.is_cancelled() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.finished_ok.emit([])
+
+    delivered: list[object] = []
+    worker = SlowWorker()
+    worker.finished_ok.connect(delivered.append)
+    window._install_worker = worker  # type: ignore[assignment]
+    window.show()
+    worker.start()
+
+    started = time.monotonic()
+    assert window.close() is False  # deferred, not blocking
+    assert time.monotonic() - started < 1
+    assert worker.is_cancelled()
+    assert window.isVisible()
+
+    deadline = time.monotonic() + 5
+    while window.isVisible() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    assert not window.isVisible()
+    assert not worker.isRunning()
+    assert delivered == []  # result slots were disconnected while closing
+
+
+def test_stale_update_check_results_are_discarded(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-stale")
+    old_dir, new_dir = tmp_path / "old", tmp_path / "new"
+    window._engines_dir = new_dir
+    window._update_worker = SimpleNamespace(  # type: ignore[assignment]
+        engines_dir=old_dir, isRunning=lambda: True
+    )
+    window._updates = set()
+
+    # A check requested while one runs is queued, not dropped.
+    window._start_update_check()
+    assert window._update_recheck_pending
+
+    window._update_recheck_pending = False
+    window._on_updates_checked({"jackett.py"})
+    assert window._updates == set()
+    assert window._update_recheck_pending
+
+    window._update_recheck_pending = False
+    window._update_worker.engines_dir = new_dir
+    window._on_updates_checked({"jackett.py"})
+    assert window._updates == {"jackett.py"}
+    window._update_worker = None
+    window.close()
+    assert app is not None
+
+
+def test_hidden_checked_plugins_need_confirmation(tmp_path: Path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-hidden")
+    shown = _plugin(name="Shown", download_url="https://example.com/shown.py")
+    hidden = _plugin(
+        name="Hidden", download_url="https://example.com/hidden.py", warning=True
+    )
+    window._all_plugins = [shown, hidden]
+    window._visible_plugins = [shown]
+    window._checked = {window._plugin_key(shown), window._plugin_key(hidden)}
+
+    boxes: list[QMessageBox] = []
+    choice = {"text": "Visible only"}
+    chosen: dict[str, object] = {}
+
+    def fake_exec(self):  # noqa: ANN001
+        boxes.append(self)
+        chosen["btn"] = next(
+            (b for b in self.buttons() if b.text() == choice["text"]), None
+        )
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: chosen.get("btn"))
+
+    selected = window._selected_plugins()
+    assert window._confirm_hidden_selection(selected) == [shown]
+    assert boxes[-1].defaultButton().text() == "Visible only"
+    assert "Hidden" in boxes[-1].text()
+    choice["text"] = "Install all"
+    assert window._confirm_hidden_selection(selected) == [shown, hidden]
+    choice["text"] = "Cancel"
+    assert window._confirm_hidden_selection(selected) == []
+
+    # Nothing hidden: no prompt.
+    count = len(boxes)
+    assert window._confirm_hidden_selection([shown]) == [shown]
+    assert len(boxes) == count
+    window.close()
+    assert app is not None
+
+
+def test_filename_conflict_check_covers_hidden_rows(tmp_path: Path, monkeypatch):
+    from PySide6.QtWidgets import QTreeWidgetItem
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-conflict")
+    mine = _plugin(name="Mine", download_url="https://example.com/a/jackett.py")
+    fork = _plugin(name="Fork", download_url="https://example.com/b/jackett.py")
+    other = _plugin(name="Other", download_url="https://example.com/other.py")
+    window._all_plugins = [mine, fork, other]
+    window._visible_plugins = [mine, other]  # fork hidden by filters
+    window._checked = {window._plugin_key(p) for p in (mine, fork, other)}
+
+    window._uncheck_filename_conflicts(QTreeWidgetItem(), mine)
+
+    assert window._checked == {window._plugin_key(mine), window._plugin_key(other)}
+    window.close()
+    assert app is not None
+
+
+def test_dynamic_text_never_rendered_as_html(tmp_path: Path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    from qbit_plugin_dl.gui import show_plain_message
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-plain")
+    boxes: list[QMessageBox] = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: boxes.append(self) or 0)
+
+    evil = "<a href='file:///etc/passwd'>click</a><img src='https://x/y.png'>"
+    show_plain_message(window, QMessageBox.Icon.Critical, "Install error", evil)
+    assert boxes[-1].textFormat() == Qt.TextFormat.PlainText
+    assert boxes[-1].text() == evil
+
+    assert window.status_label.textFormat() == Qt.TextFormat.PlainText
+    window._set_status(f"Foo <h1 style='font-size:80px'>: {evil}")
+    assert "<h1" not in window.status_label.toolTip().removeprefix("<qt>")
+    window.close()
+    assert app is not None
+
+
+def test_update_all_defaults_to_no(tmp_path: Path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-upd")
+    boxes: list[QMessageBox] = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: boxes.append(self) or 0)
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: None)
+    started: list[object] = []
+    monkeypatch.setattr(window, "_start_install", started.append)
+
+    window._all_plugins = [_plugin()]
+    window._updates = {"demo.py"}
+    window.update_all_outdated()
+
+    box = boxes[-1]
+    assert box.standardButton(box.defaultButton()) == QMessageBox.StandardButton.No
+    assert "Demo" in box.text()
+    assert started == []  # dismissed dialog never reinstalls
+    window.close()
+    assert app is not None
+
+
+def test_controls_stay_disabled_while_install_runs(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-busy")
+    window._install_worker = SimpleNamespace(isRunning=lambda: True)  # type: ignore[assignment]
+    window._set_busy_for_install(True)
+    assert not window.path_combo.isEnabled()
+    assert not window.browse_btn.isEnabled()
+    assert not window.refresh_btn.isEnabled()
+
+    # A category job finishing mid-install must not re-enable Refresh.
+    monkeypatch.setattr(window, "_start_update_check", lambda: None)
+    window._on_categories_loaded([])
+    assert not window.refresh_btn.isEnabled()
+
+    window._install_worker = SimpleNamespace(isRunning=lambda: False)  # type: ignore[assignment]
+    window._set_busy_for_install(False)
+    assert window.path_combo.isEnabled() and window.refresh_btn.isEnabled()
+    window._install_worker = None
+    window.close()
+    assert app is not None

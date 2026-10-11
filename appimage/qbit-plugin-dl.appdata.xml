@@ -17,7 +17,14 @@
     </p>
   </description>
   <launchable type="desktop-id">qbit-plugin-dl.desktop</launchable>
+  <url type="homepage">https://github.com/asafelobotomy/qbit-plugin-dl</url>
+  <url type="bugtracker">https://github.com/asafelobotomy/qbit-plugin-dl/issues</url>
+  <url type="vcs-browser">https://github.com/asafelobotomy/qbit-plugin-dl</url>
   <url type="help">https://github.com/qbittorrent/search-plugins/wiki/Unofficial-search-plugins</url>
+  <developer id="io.github.asafelobotomy">
+    <name>aSafeLobotomy</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
   <provides>
     <binary>qbit-plugin-dl</binary>
   </provides>

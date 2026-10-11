@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import os
+import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -28,6 +30,7 @@ from qbit_plugin_dl.fix import (
     ranked_alternates,
     try_ast_fix_after_clamav,
 )
+from qbit_plugin_dl.paths import atomic_write_bytes, xdg_base_dir
 from qbit_plugin_dl.provenance import (
     content_sha,
     content_sha256,
@@ -39,7 +42,7 @@ from qbit_plugin_dl.provenance import (
 def candidate_engine_dirs(home: Path | None = None) -> list[Path]:
     """Return known Linux engines paths in preference order."""
     home = home or Path.home()
-    xdg_data = Path(os.environ.get("XDG_DATA_HOME", str(home / ".local" / "share")))
+    xdg_data = xdg_base_dir("XDG_DATA_HOME", home / ".local" / "share")
     return [
         home
         / ".var"
@@ -118,12 +121,23 @@ def list_installed_filenames(engines_dir: Path) -> set[str]:
     return {path.name for path in engines_dir.glob("*.py")}
 
 
+# qBittorrent imports engines as ``engines.<stem>``, so a valid engine name is a
+# plain ASCII identifier. A leading letter also rules out ``__init__.py``.
+_ENGINE_FILENAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\.py")
+
+# nova3 / engines package modules an engine must never replace or shadow.
+_RESERVED_ENGINE_STEMS: frozenset[str] = frozenset(
+    {"helpers", "novaprinter", "nova2", "nova2dl", "socks", "sgmllib3", "template"}
+)
+
+
 def validate_plugin_filename(name: str) -> str:
     """
-    Require a safe .py basename with no path components.
+    Require a safe engine basename: ``<identifier>.py`` with no path components.
 
-    Raises ValueError when the name is empty, not a .py file, or contains
-    separators / parent references.
+    Raises ValueError for empty names, paths, non-``.py`` files, names that are
+    not plain ASCII identifiers (``__init__.py``, globs, spaces, control or
+    bidi characters, over-long names) and qBittorrent's own module names.
     """
     if not name or name in {".", ".."}:
         raise ValueError("Invalid plugin filename")
@@ -133,6 +147,13 @@ def validate_plugin_filename(name: str) -> str:
         raise ValueError(f"Plugin filename must not contain '..': {name!r}")
     if not name.endswith(".py"):
         raise ValueError(f"Plugin filename must end with .py: {name!r}")
+    if not _ENGINE_FILENAME_RE.fullmatch(name):
+        raise ValueError(
+            "Plugin filename must be a letter followed by up to 63 letters, "
+            f"digits or underscores, ending in .py: {name!r}"
+        )
+    if name[:-3].lower() in _RESERVED_ENGINE_STEMS:
+        raise ValueError(f"Plugin filename is reserved by qBittorrent: {name!r}")
     return name
 
 
@@ -240,9 +261,11 @@ def companion_paths_for_engine(engines_dir: Path, filename: str) -> list[Path]:
 
     candidates: list[Path] = [
         dest,
-        Path(str(dest) + ".tmp"),
+        Path(str(dest) + ".tmp"),  # legacy fixed temp name
         engines_dir / f"{stem}.json",
     ]
+    # Leftovers from atomic_write_bytes (".<name>.<random>.tmp").
+    candidates.extend(engines_dir.glob(f".{glob.escape(safe_name)}.*.tmp"))
 
     for cache_dir in (engines_dir / "__pycache__", nova3_root / "__pycache__"):
         if not cache_dir.is_dir():
@@ -256,8 +279,11 @@ def companion_paths_for_engine(engines_dir: Path, filename: str) -> list[Path]:
             cache_resolved.relative_to(nova3_root)
         except ValueError:
             continue
-        for path in cache_dir.glob(f"{stem}*.pyc"):
-            candidates.append(path)
+        # Exactly this module's bytecode ("<stem>.cpython-312.pyc" or
+        # "<stem>.pyc"), never other modules sharing the prefix.
+        escaped = glob.escape(stem)
+        candidates.extend(cache_dir.glob(f"{escaped}.*.pyc"))
+        candidates.append(cache_dir / f"{stem}.pyc")
 
     # De-dupe while preserving order; only return existing files that stay
     # contained under nova3.
@@ -409,36 +435,22 @@ def _write_engine(
     source_bytes: bytes | None = None,
     install_filename: str | None = None,
 ) -> InstallResult:
-    dest_tmp = Path(str(dest) + ".tmp")
     provenance_error: str | None = None
     provenance_name = install_filename or plugin.filename
     try:
         # Re-validate containment immediately before replace (symlink TOCTOU).
         dest = resolve_plugin_dest(engines_dir, provenance_name)
-        dest_tmp = Path(str(dest) + ".tmp")
-        fd = os.open(
-            dest_tmp,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            0o600,
+        atomic_write_bytes(dest, content)
+    except (OSError, ValueError) as exc:
+        # Disk full, read-only dir, name too long, containment change, …:
+        # fail this plugin only, never the whole batch.
+        return InstallResult(
+            plugin=plugin,
+            ok=False,
+            path=None,
+            error=f"Could not write {provenance_name}: {exc}",
+            fix=fix,
         )
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except Exception:
-            try:
-                dest_tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-        os.replace(dest_tmp, dest)
-    except Exception:
-        try:
-            dest_tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
 
     written_sha = content_sha(content)
     written_sha256 = content_sha256(content)
@@ -594,6 +606,8 @@ async def _install_plugin_with_optional_fix(
                     source_bytes=source_bytes_before_ast,
                     install_filename=install_filename,
                 )
+                if not result.ok:
+                    return replace(result, audit=report)
                 return InstallResult(
                     plugin=current,
                     ok=True,
@@ -650,6 +664,8 @@ async def _install_plugin_with_optional_fix(
             fix=None,
             install_filename=install_filename,
         )
+        if not result.ok:
+            return replace(result, audit=report)
         return InstallResult(
             plugin=current,
             ok=True,
@@ -698,17 +714,25 @@ async def install_plugins_async(
     completed = 0
 
     async def _run_one(index: int, plugin: Plugin) -> tuple[int, InstallResult]:
-        result = await _download_one(
-            client,
-            plugin,
-            engines_dir,
-            semaphore,
-            clamav_session,
-            auto_fix=auto_fix,
-            alternates_by_filename=filename_alternates,
-            trusted_hosts=trusted_hosts,
-            allow_ast_without_clamav=allow_ast_without_clamav,
-        )
+        try:
+            result = await _download_one(
+                client,
+                plugin,
+                engines_dir,
+                semaphore,
+                clamav_session,
+                auto_fix=auto_fix,
+                alternates_by_filename=filename_alternates,
+                trusted_hosts=trusted_hosts,
+                allow_ast_without_clamav=allow_ast_without_clamav,
+            )
+        except Exception as exc:  # noqa: BLE001 — isolate one plugin's failure
+            result = InstallResult(
+                plugin=plugin,
+                ok=False,
+                path=None,
+                error=f"Unexpected error: {type(exc).__name__}: {exc}",
+            )
         return index, result
 
     try:

@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
 import httpx
+
+from qbit_plugin_dl.http_util import (
+    MetadataFetchError,
+    get_capped,
+    get_capped_async,
+)
 
 _RAW_HOST = "raw.githubusercontent.com"
 _DEPRECATED_PREFIX = re.compile(
@@ -26,6 +33,26 @@ class GitHubRawRef:
     path: str
 
 
+def _is_unsafe_path_segment(segment: str) -> bool:
+    """Empty, dot, or encoded-separator segments that could change the target repo."""
+    if not segment:
+        return True
+    decoded = unquote(segment)
+    return (
+        decoded in {".", ".."}
+        or "/" in decoded
+        or "\\" in decoded
+        or "%" in decoded
+    )
+
+
+def is_github_raw_host(url: str) -> bool:
+    try:
+        return (urlparse(url.strip()).hostname or "").lower() == _RAW_HOST
+    except ValueError:
+        return False
+
+
 def parse_github_raw_url(url: str) -> GitHubRawRef | None:
     """
     Parse ``raw.githubusercontent.com/{owner}/{repo}/{ref}/path…``.
@@ -40,7 +67,12 @@ def parse_github_raw_url(url: str) -> GitHubRawRef | None:
         return None
     if (parsed.hostname or "").lower() != _RAW_HOST:
         return None
-    parts = [unquote(p) for p in parsed.path.split("/") if p]
+    raw_parts = parsed.path.split("/")[1:]
+    # httpx normalizes dot segments before sending, so ``repo/../../other`` would
+    # be trusted as *repo* but fetched from *other*. Refuse anything ambiguous.
+    if any(_is_unsafe_path_segment(p) for p in raw_parts):
+        return None
+    parts = [unquote(p) for p in raw_parts]
     if len(parts) < 4:
         return None
     owner, repo = parts[0], parts[1]
@@ -129,6 +161,19 @@ def paths_from_tree_payload(payload: object) -> list[str]:
     return paths
 
 
+_API_HOSTS = frozenset({"api.github.com"})
+
+
+def _tree_payload(status: int, body: bytes) -> object | None:
+    """Parsed Git Trees API JSON, or None (rate limit, error, bad JSON)."""
+    if status != 200:
+        return None
+    try:
+        return json.loads(body)
+    except (ValueError, RecursionError):
+        return None
+
+
 def recover_github_raw_url(
     client: httpx.Client,
     url: str,
@@ -150,20 +195,17 @@ def recover_github_raw_url(
 
     api = tree_api_url(parsed.owner, parsed.repo, parsed.ref)
     try:
-        response = client.get(
+        status, body = get_capped(
+            client,
             api,
+            allowed_hosts=_API_HOSTS,
             headers={"Accept": "application/vnd.github+json"},
             timeout=30.0,
         )
-    except httpx.HTTPError:
+    except (httpx.HTTPError, MetadataFetchError):
         return None
-    if response.status_code == 403 or response.status_code == 429:
-        return None
-    if response.status_code != 200:
-        return None
-    try:
-        payload = response.json()
-    except ValueError:
+    payload = _tree_payload(status, body)
+    if payload is None:
         return None
 
     ranked = rank_matching_paths(paths_from_tree_payload(payload), expected)
@@ -193,20 +235,17 @@ async def recover_github_raw_url_async(
 
     api = tree_api_url(parsed.owner, parsed.repo, parsed.ref)
     try:
-        response = await client.get(
+        status, body = await get_capped_async(
+            client,
             api,
+            allowed_hosts=_API_HOSTS,
             headers={"Accept": "application/vnd.github+json"},
             timeout=30.0,
         )
-    except httpx.HTTPError:
+    except (httpx.HTTPError, MetadataFetchError):
         return None
-    if response.status_code in {403, 429}:
-        return None
-    if response.status_code != 200:
-        return None
-    try:
-        payload = response.json()
-    except ValueError:
+    payload = _tree_payload(status, body)
+    if payload is None:
         return None
 
     ranked = rank_matching_paths(paths_from_tree_payload(payload), expected)

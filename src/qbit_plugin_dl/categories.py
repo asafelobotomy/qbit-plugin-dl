@@ -20,7 +20,11 @@ from qbit_plugin_dl.fetch import (
     FetchError,
     fetch_with_github_recovery_async,
 )
-from qbit_plugin_dl.paths import atomic_write_text, cache_dir
+from qbit_plugin_dl.paths import (
+    atomic_write_text,
+    cache_dir,
+    read_json_object_of_dicts,
+)
 from qbit_plugin_dl.provenance import content_sha, content_sha256
 
 QBIT_CATEGORIES = (
@@ -157,7 +161,9 @@ def parse_supported_categories(source: str) -> frozenset[str]:
     literal = source[start:end]
     try:
         value = ast.literal_eval(literal)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
+        # Untrusted source: deep nesting can exhaust the evaluator on
+        # interpreters without the parser's nesting guard.
         return frozenset()
 
     if not isinstance(value, dict):
@@ -202,11 +208,7 @@ def load_categories_cache(path: Path | None = None) -> dict[str, dict]:
     path = path or categories_cache_file()
     if not path.is_file():
         return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return read_json_object_of_dicts(path)
 
 
 def save_categories_cache(
