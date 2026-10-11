@@ -1,11 +1,17 @@
 name: Release
 
+# Releases are cut by pushing a version tag (``vX.Y.Z``) that matches
+# pyproject.toml / __init__.py / AppStream and points at a commit on main.
 on:
   push:
-    branches: [main]
-  # Manual re-run (e.g. after a failed publish). Still only releases a
-  # version whose tag does not exist yet, and only from main.
+    tags: ["v*"]
+  # Manual re-run of an existing tag (e.g. after a failed publish).
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re)build, e.g. v0.2.0"
+        required: true
+        type: string
 
 # Least privilege by default. Only the small publish job, which runs no
 # third-party build code, gets a write-scoped token.
@@ -19,28 +25,37 @@ concurrency:
 jobs:
   build:
     name: Build and test AppImage
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
       contents: read
     outputs:
-      should_release: ${{ steps.version.outputs.should_release }}
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          # Tag push: the tag itself. Manual run: the requested tag.
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
           fetch-depth: 0
           # pip installs and tests run in this job; keep no token in .git/config.
           persist-credentials: false
 
-      - name: Detect unreleased version
+      - name: Verify tag matches version and main
         id: version
+        env:
+          # Via env, never interpolated into the script (input is user-supplied).
+          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
+
+          if [[ ! "${REQUESTED_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must look like vX.Y.Z (got '${REQUESTED_TAG}')"
+            exit 1
+          fi
 
           version="$(python3 - <<'PY'
           import tomllib
@@ -71,30 +86,32 @@ jobs:
           fi
 
           tag="v${version}"
+          if [[ "${REQUESTED_TAG}" != "${tag}" ]]; then
+            echo "::error::Tag ${REQUESTED_TAG} does not match project version ${version} (expected ${tag})"
+            exit 1
+          fi
+
+          sha="$(git rev-parse "refs/tags/${tag}^{commit}")"
+          # Only release reviewed code: the tagged commit must be on main.
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${sha}" FETCH_HEAD; then
+            echo "::error::Tag ${tag} (${sha}) is not on main"
+            exit 1
+          fi
+
+          echo "Will release ${tag} at ${sha}"
           {
             echo "version=${version}"
             echo "tag=${tag}"
+            echo "sha=${sha}"
           } >> "$GITHUB_OUTPUT"
 
-          # Release whenever the current version has no tag yet. (Comparing
-          # only against HEAD^ silently skipped bumps that were not the last
-          # commit of a push.)
-          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-            echo "Tag ${tag} already exists — skipping release."
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Will release ${tag}"
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Set up Python
-        if: steps.version.outputs.should_release == 'true'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
 
       - name: Install system dependencies
-        if: steps.version.outputs.should_release == 'true'
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -105,7 +122,6 @@ jobs:
           fi
 
       - name: Install package and run tests
-        if: steps.version.outputs.should_release == 'true'
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
@@ -115,7 +131,6 @@ jobs:
           python -m pytest -q
 
       - name: Build AppImage
-        if: steps.version.outputs.should_release == 'true'
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
           PYTHON_VERSION: "3.12"
@@ -126,7 +141,6 @@ jobs:
           ls -lh qbit-plugin-dl*.AppImage
 
       - name: Smoke-test AppImage
-        if: steps.version.outputs.should_release == 'true'
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
@@ -217,7 +231,6 @@ jobs:
           fi
 
       - name: Write checksums
-        if: steps.version.outputs.should_release == 'true'
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -236,7 +249,6 @@ jobs:
           cat "$checksums"
 
       - name: Upload release assets
-        if: steps.version.outputs.should_release == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets
@@ -249,7 +261,6 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: build
-    if: needs.build.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -263,6 +274,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          # The exact commit the build job verified and built.
+          ref: ${{ needs.build.outputs.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -283,6 +296,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.build.outputs.version }}
           TAG: ${{ needs.build.outputs.tag }}
+          SHA: ${{ needs.build.outputs.sha }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -295,10 +309,11 @@ jobs:
           checksums="SHA256SUMS.txt"
           sha256sum -c "$checksums"
 
-          prev_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          # Previous release tag reachable from this one (not the tag itself).
+          prev_tag="$(git describe --tags --abbrev=0 --match 'v*' "${SHA}^" 2>/dev/null || true)"
 
           {
-            echo "## qbit-plugin-dl ${VERSION}"
+            echo "## qbit - Torrent Plugin Manager ${VERSION}"
             echo
             echo "Selective installer for qBittorrent search plugins (multi-source catalogs, update checks, AppImage)."
             echo
@@ -328,13 +343,13 @@ jobs:
             else
               echo "### Initial release"
               echo
-              echo "This is the first tagged release of qbit-plugin-dl."
+              echo "This is the first tagged release of qbit - Torrent Plugin Manager."
             fi
             echo
             echo "---"
             echo
 
-            gen_args=( -f "tag_name=${TAG}" -f "target_commitish=${GITHUB_SHA}" )
+            gen_args=( -f "tag_name=${TAG}" -f "target_commitish=${SHA}" )
             if [[ -n "$prev_tag" && "$prev_tag" != "$TAG" ]]; then
               gen_args+=( -f "previous_tag_name=${prev_tag}" )
             fi
@@ -359,8 +374,14 @@ jobs:
           shopt -s nullglob
           files=(qbit-plugin-dl*.AppImage SHA256SUMS.txt)
 
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::Release ${TAG} already exists; delete it first to re-publish"
+            exit 1
+          fi
+
+          # The tag already exists (it triggered this run); never create one.
           gh release create "$TAG" \
-            --title "qbit-plugin-dl ${VERSION}" \
+            --verify-tag \
+            --title "qbit - Torrent Plugin Manager ${VERSION}" \
             --notes-file RELEASE_NOTES.md \
-            --target "${GITHUB_SHA}" \
             "${files[@]}"

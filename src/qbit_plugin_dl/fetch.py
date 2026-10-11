@@ -392,6 +392,20 @@ def _host_fetch_error(url: str, message: str) -> FetchError:
     )
 
 
+def untrusted_redirect(error: FetchError | None, url: str) -> FetchError | None:
+    """
+    *error* when a redirect hop away from *url* was refused for lack of consent.
+
+    Callers can offer ``error.trust_key`` for approval and retry. Refusals of
+    *url* itself, or of hops with no offerable key, return None.
+    """
+    if error is None or error.code != "host" or not error.trust_key:
+        return None
+    if not error.blocked_url or error.blocked_url == url:
+        return None
+    return error
+
+
 def _redirect_target(current_url: str, response: httpx.Response) -> str | None:
     if not response.is_redirect:
         return None

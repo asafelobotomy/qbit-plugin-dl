@@ -62,6 +62,7 @@ from qbit_plugin_dl.categories import (
     format_categories,
 )
 from qbit_plugin_dl.fetch import (
+    FetchError,
     trust_key_for_url,
     trust_key_label,
     untrusted_hosts_in_urls,
@@ -840,6 +841,8 @@ class CategoryWorker(_CancellableWorker):
         self.plugins = plugins
         self.force_refresh = force_refresh
         self.trusted_hosts = trusted_hosts or set()
+        # Catalog URL → refused redirect; complete before finished_ok fires.
+        self.untrusted_redirects: dict[str, FetchError] = {}
 
     def run(self) -> None:
         try:
@@ -853,6 +856,7 @@ class CategoryWorker(_CancellableWorker):
                 force_refresh=self.force_refresh,
                 on_progress=on_progress,
                 trusted_hosts=self.trusted_hosts,
+                untrusted_redirects=self.untrusted_redirects,
             )
             self.finished_ok.emit(enriched)
         except WorkerCancelled:
@@ -979,6 +983,8 @@ class UpdateCheckWorker(QThread):
         self.engines_dir = engines_dir
         self.plugins = plugins
         self.trusted_hosts = trusted_hosts or set()
+        # Catalog URL → refused redirect; complete before finished_ok fires.
+        self.untrusted_redirects: dict[str, FetchError] = {}
 
     def run(self) -> None:
         try:
@@ -986,6 +992,7 @@ class UpdateCheckWorker(QThread):
                 self.engines_dir,
                 self.plugins,
                 trusted_hosts=self.trusted_hosts,
+                untrusted_redirects=self.untrusted_redirects,
             )
             self.finished_ok.emit(outdated)
         except Exception as exc:  # noqa: BLE001
@@ -1100,7 +1107,7 @@ def show_plain_message(
 class MainWindow(QMainWindow):
     def __init__(self, icon: QIcon | None = None) -> None:
         super().__init__()
-        self.setWindowTitle(f"qBittorrent Plugin Downloader {__version__}")
+        self.setWindowTitle(f"qbit - Torrent Plugin Manager {__version__}")
         self.resize(1100, 700)
         if icon is not None and not icon.isNull():
             self.setWindowIcon(icon)
@@ -1131,6 +1138,8 @@ class MainWindow(QMainWindow):
         self._install_session: ClamAvSession | None = None
         self._install_carried: list[InstallResult] = []
         self._install_redirect_round = 0
+        self._category_redirect_round = 0
+        self._update_redirect_round = 0
         # Window close requested while workers run: cancel them, keep the
         # event loop alive, and close for real once every thread has finished.
         self._closing = False
@@ -1352,9 +1361,9 @@ class MainWindow(QMainWindow):
     def _show_about(self) -> None:
         QMessageBox.about(
             self,
-            "About qBittorrent Plugin Downloader",
+            "About qbit - Torrent Plugin Manager",
             (
-                f"<b>qBittorrent Plugin Downloader</b> {__version__}<br><br>"
+                f"<b>qbit - Torrent Plugin Manager</b> {__version__}<br><br>"
                 "Selective installer for qBittorrent search plugins from multiple "
                 "allowlisted catalogs (unofficial wiki, official nova3 engines, "
                 "and LightDestory).<br><br>"
@@ -1493,7 +1502,7 @@ class MainWindow(QMainWindow):
             else:
                 examples.append(label)
 
-        return self._confirm_trust_keys(
+        approved = self._confirm_trust_keys(
             unknown,
             title="Untrusted download sources",
             text=(
@@ -1505,6 +1514,8 @@ class MainWindow(QMainWindow):
             details=f"Approve to continue this {purpose}:\n\n" + "\n\n".join(examples),
             required=required,
         )
+        # Optional (read-only) fetches continue without the new sources.
+        return approved or not required
 
     def _confirm_trust_keys(
         self,
@@ -1515,7 +1526,12 @@ class MainWindow(QMainWindow):
         details: str,
         required: bool = True,
     ) -> bool:
-        """Ask Trust once / Always trust / Cancel for *keys*; record the choice."""
+        """
+        Ask Trust once / Always trust / Cancel for *keys*; record the choice.
+
+        Returns True only when the user approved. *required* picks install vs
+        read-only scope for "Trust once"; read-only declines are remembered.
+        """
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle(title)
@@ -1545,32 +1561,39 @@ class MainWindow(QMainWindow):
             return True
         if not required:
             self._declined_download_hosts.update(keys)
-        return not required
+        return False
 
-    def _prompt_redirect_trust(self, results: list[InstallResult]) -> list[Plugin]:
+    def _prompt_redirect_trust(
+        self,
+        items: list[tuple[Plugin, FetchError]],
+        *,
+        purpose: str = "install",
+        required: bool = True,
+    ) -> list[Plugin]:
         """
-        Ask to approve sources that installs were redirected to.
+        Ask to approve sources that downloads were redirected to.
 
         Returns the plugins to retry (empty when the user cancels). The catalog
         URL was already approved; the redirect lands on a different project or
         host (e.g. a renamed GitLab namespace), which needs its own consent.
+        Read-only purposes (*required* False) use read-scoped "Trust once" and
+        never re-ask about sources the user declined this session.
         """
-        trusted = self._effective_trusted_hosts(install=True)
+        trusted = self._effective_trusted_hosts(install=required)
         keys: list[str] = []
         lines: list[str] = []
         retry: list[Plugin] = []
-        for result in results:
-            err = result.untrusted_redirect
-            if err is None:
+        for plugin, err in items:
+            if not required and err.trust_key in self._declined_download_hosts:
                 continue
-            retry.append(result.plugin)
+            retry.append(plugin)
             if err.trust_key in trusted:
                 continue  # approved meanwhile (e.g. by an earlier row)
             if err.trust_key not in keys:
                 keys.append(err.trust_key)
             lines.append(
-                f"{result.plugin.name}: {trust_key_label(err.trust_key)}\n"
-                f"  from {result.plugin.download_url}\n"
+                f"{plugin.name}: {trust_key_label(err.trust_key)}\n"
+                f"  from {plugin.download_url}\n"
                 f"  to   {err.blocked_url}"
             )
         if not retry:
@@ -1583,10 +1606,24 @@ class MainWindow(QMainWindow):
                 "you approved. A redirect can mean the project moved, or that "
                 "the original location now points somewhere else."
             ),
-            details="Approve the new source and retry?\n\n" + "\n\n".join(lines),
+            details=(
+                f"Approve the new source and retry the {purpose}?\n\n"
+                + "\n\n".join(lines)
+            ),
+            required=required,
         ):
             return []
         return retry
+
+    def _redirect_items(
+        self,
+        redirects: dict[str, FetchError],
+        plugins: list[Plugin],
+    ) -> list[tuple[Plugin, FetchError]]:
+        by_url = {p.download_url: p for p in plugins}
+        return [
+            (by_url[url], err) for url, err in redirects.items() if url in by_url
+        ]
 
     def _plugin_key(self, plugin: Plugin) -> tuple[str, str]:
         return (plugin.name, plugin.download_url)
@@ -1680,9 +1717,15 @@ class MainWindow(QMainWindow):
         self.status_label.setText(self._status_base)
         self._start_category_enrichment(force_refresh=self._force_category_refresh)
 
-    def _start_category_enrichment(self, force_refresh: bool = False) -> None:
+    def _start_category_enrichment(
+        self,
+        force_refresh: bool = False,
+        *,
+        redirect_round: int = 0,
+    ) -> None:
         if self._category_worker and self._category_worker.isRunning():
             return
+        self._category_redirect_round = redirect_round
         if not self._all_plugins:
             self._sync_refresh_button()
             self._start_update_check()
@@ -1718,6 +1761,24 @@ class MainWindow(QMainWindow):
 
     def _on_categories_loaded(self, plugins: list) -> None:
         self._all_plugins = plugins
+        worker = self._category_worker
+        if (
+            worker is not None
+            and worker.untrusted_redirects
+            and self._category_redirect_round < _MAX_REDIRECT_TRUST_ROUNDS
+            and self._prompt_redirect_trust(
+                self._redirect_items(worker.untrusted_redirects, plugins),
+                purpose="category resolve",
+                required=False,
+            )
+        ):
+            # Redirected rows were not cached, so a normal pass refetches only
+            # them; everything else comes from the cache.
+            worker.wait()
+            self._start_category_enrichment(
+                redirect_round=self._category_redirect_round + 1
+            )
+            return
         self._sync_refresh_button()
         self.progress.setVisible(False)
         categorized = sum(1 for p in plugins if p.categories)
@@ -1809,9 +1870,10 @@ class MainWindow(QMainWindow):
             )
         self.update_all_btn.setEnabled(bool(self._updates) and not busy)
 
-    def _start_update_check(self) -> None:
+    def _start_update_check(self, *, redirect_round: int = 0) -> None:
         if self._closing:
             return
+        self._update_redirect_round = redirect_round
         if self._update_worker and self._update_worker.isRunning():
             # Results of the running check may be for an old directory or
             # predate an install; re-check once it ends.
@@ -1870,6 +1932,20 @@ class MainWindow(QMainWindow):
         self._rebuild_tree()
         self._refresh_status_label()
         self._sync_update_all_button()
+
+        worker = self._update_worker
+        if (
+            worker is not None
+            and worker.untrusted_redirects
+            and self._update_redirect_round < _MAX_REDIRECT_TRUST_ROUNDS
+            and self._prompt_redirect_trust(
+                self._redirect_items(worker.untrusted_redirects, self._all_plugins),
+                purpose="update check",
+                required=False,
+            )
+        ):
+            worker.wait()
+            self._start_update_check(redirect_round=self._update_redirect_round + 1)
 
     def _on_updates_failed(self, message: str) -> None:
         if not self._update_result_is_current():
@@ -2257,7 +2333,13 @@ class MainWindow(QMainWindow):
         carried = self._install_carried
         self._install_carried = []
         if self._install_redirect_round < _MAX_REDIRECT_TRUST_ROUNDS:
-            retry = self._prompt_redirect_trust(results)
+            retry = self._prompt_redirect_trust(
+                [
+                    (r.plugin, r.untrusted_redirect)
+                    for r in results
+                    if r.untrusted_redirect is not None
+                ]
+            )
             if retry:
                 retry_ids = {id(p) for p in retry}
                 keep = carried + [r for r in results if id(r.plugin) not in retry_ids]
@@ -2378,7 +2460,7 @@ def run_app() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("qbit-plugin-dl")
-    app.setApplicationDisplayName("qBittorrent Plugin Downloader")
+    app.setApplicationDisplayName("qbit - Torrent Plugin Manager")
     app.setOrganizationName("qbit-plugin-dl")
     app.setOrganizationDomain("qbit-plugin-dl.local")
     app.setDesktopFileName("qbit-plugin-dl")

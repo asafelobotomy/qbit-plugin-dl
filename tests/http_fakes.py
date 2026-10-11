@@ -183,7 +183,7 @@ class SyncMapClient:
 
     def __init__(
         self,
-        mapping: dict[str, bytes],
+        mapping: dict[str, bytes | FakeStreamResponse],
         *,
         chunk_size: int = 65536,
     ) -> None:
@@ -201,9 +201,11 @@ class SyncMapClient:
     ):
         del method, follow_redirects, kwargs
         self.gets.append(url)
-        yield FakeStreamResponse(
-            self.mapping[url], url, chunk_size=self._chunk_size
-        )
+        value = self.mapping[url]
+        if isinstance(value, FakeStreamResponse):
+            yield value
+            return
+        yield FakeStreamResponse(value, url, chunk_size=self._chunk_size)
 
     def get(self, url: str) -> FakeStreamResponse:
         self.gets.append(url)

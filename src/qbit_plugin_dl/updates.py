@@ -15,6 +15,7 @@ from qbit_plugin_dl.fetch import (
     MAX_REDIRECTS,
     FetchError,
     fetch_with_github_recovery,
+    untrusted_redirect,
 )
 from qbit_plugin_dl.install import list_installed_filenames
 from qbit_plugin_dl.provenance import (
@@ -122,8 +123,13 @@ def fetch_remote_sha(
     trusted_hosts: Collection[str] | None = None,
     prefer_full: bool = False,
     basename: str | None = None,
+    untrusted_redirects: dict[str, FetchError] | None = None,
 ) -> str | None:
-    """HTTPS GET plugin body, hash it, and optionally refresh categories cache sha."""
+    """
+    HTTPS GET plugin body, hash it, and optionally refresh categories cache sha.
+
+    A redirect to an unapproved source is added to *untrusted_redirects*.
+    """
     result = fetch_with_github_recovery(
         client,
         download_url,
@@ -132,6 +138,9 @@ def fetch_remote_sha(
         trusted_hosts=trusted_hosts,
     )
     if isinstance(result, FetchError):
+        redirect = untrusted_redirect(result, download_url)
+        if redirect is not None and untrusted_redirects is not None:
+            untrusted_redirects[download_url] = redirect
         return None
     url_used = result.final_url
     content = result.content
@@ -185,9 +194,13 @@ def find_outdated_filenames(
     client: httpx.Client | None = None,
     remote_shas: Mapping[str, str] | None = None,
     trusted_hosts: Collection[str] | None = None,
+    untrusted_redirects: dict[str, FetchError] | None = None,
 ) -> set[str]:
     """
     Return installed basenames whose **catalog source** content has changed.
+
+    Sources that redirected to an unapproved project/host are skipped and
+    added to *untrusted_redirects* (keyed by catalog URL).
 
     Compares the install-time baseline (provenance source/content hash) to the
     current remote body at the same hash width. Local edits alone do not count
@@ -283,6 +296,7 @@ def find_outdated_filenames(
                     trusted_hosts=trusted_hosts,
                     prefer_full=prefer_full,
                     basename=filename,
+                    untrusted_redirects=untrusted_redirects,
                 )
                 if remote is not None:
                     remote_map[url] = remote

@@ -21,6 +21,7 @@ from qbit_plugin_dl.fetch import (
     FetchError,
     fetch_with_github_recovery_async,
     require_https_url,
+    untrusted_redirect,
 )
 from qbit_plugin_dl.fix import (
     FixKind,
@@ -428,18 +429,6 @@ async def _fetch_plugin_bytes(
     return result.content, None, None
 
 
-def _untrusted_redirect(
-    error: FetchError | None,
-    plugin: Plugin,
-) -> FetchError | None:
-    """*error* when a redirect hop (not the catalog URL) needs consent."""
-    if error is None or error.code != "host" or not error.trust_key:
-        return None
-    if not error.blocked_url or error.blocked_url == plugin.download_url:
-        return None
-    return error
-
-
 def _write_engine(
     dest: Path,
     content: bytes,
@@ -554,7 +543,7 @@ async def _install_plugin_with_optional_fix(
                     tried_urls=tried_urls,
                     final_url=current.download_url,
                 ),
-                untrusted_redirect=_untrusted_redirect(fetch_err, current),
+                untrusted_redirect=untrusted_redirect(fetch_err, current.download_url),
             )
 
         if auto_fix:

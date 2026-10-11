@@ -19,6 +19,7 @@ from qbit_plugin_dl.fetch import (
     MAX_REDIRECTS,
     FetchError,
     fetch_with_github_recovery_async,
+    untrusted_redirect,
 )
 from qbit_plugin_dl.paths import (
     atomic_write_text,
@@ -257,6 +258,7 @@ async def _enrich_one(
     *,
     force_refresh: bool,
     trusted_hosts: Collection[str] | None = None,
+    untrusted_redirects: dict[str, FetchError] | None = None,
 ) -> Plugin:
     if not force_refresh:
         async with cache_lock:
@@ -275,6 +277,16 @@ async def _enrich_one(
             trusted_hosts=trusted_hosts,
         )
         if isinstance(result, FetchError):
+            redirect = untrusted_redirect(result, plugin.download_url)
+            if redirect is not None:
+                # Awaiting consent: report it and skip the cache so a retry
+                # after approval fetches instead of reusing heuristics.
+                if untrusted_redirects is not None:
+                    untrusted_redirects[plugin.download_url] = redirect
+                return replace(
+                    plugin,
+                    categories=heuristic_categories(plugin.name, plugin.site_url),
+                )
             source = None
             content_bytes = None
         else:
@@ -306,8 +318,14 @@ async def enrich_plugins_async(
     on_progress: ProgressCallback | None = None,
     client: httpx.AsyncClient | None = None,
     trusted_hosts: Collection[str] | None = None,
+    untrusted_redirects: dict[str, FetchError] | None = None,
 ) -> list[Plugin]:
-    """Fetch plugin sources and attach categories; update disk cache."""
+    """
+    Fetch plugin sources and attach categories; update disk cache.
+
+    Downloads that redirected to an unapproved source are added to
+    *untrusted_redirects* (keyed by catalog URL) and are not cached.
+    """
     if not plugins:
         return []
 
@@ -338,6 +356,7 @@ async def enrich_plugins_async(
                     semaphore,
                     force_refresh=force_refresh,
                     trusted_hosts=trusted_hosts,
+                    untrusted_redirects=untrusted_redirects,
                 )
             )
             for plugin in plugins
@@ -364,6 +383,7 @@ def enrich_plugins(
     cache_path: Path | None = None,
     on_progress: ProgressCallback | None = None,
     trusted_hosts: Collection[str] | None = None,
+    untrusted_redirects: dict[str, FetchError] | None = None,
 ) -> list[Plugin]:
     """Synchronous wrapper around enrich_plugins_async."""
     return asyncio.run(
@@ -374,6 +394,7 @@ def enrich_plugins(
             cache_path=cache_path,
             on_progress=on_progress,
             trusted_hosts=trusted_hosts,
+            untrusted_redirects=untrusted_redirects,
         )
     )
 

@@ -9,7 +9,12 @@ from qbit_plugin_dl.catalog import Plugin, Visibility
 from qbit_plugin_dl.categories import enrich_plugins_async, load_categories_cache
 from qbit_plugin_dl.install import MAX_PLUGIN_BYTES
 from qbit_plugin_dl.provenance import content_sha, content_sha256
-from tests.http_fakes import TRUSTED_TEST_HOSTS, AsyncSingleClient
+from tests.http_fakes import (
+    TRUSTED_TEST_HOSTS,
+    AsyncRedirectClient,
+    AsyncSingleClient,
+    FakeStreamResponse,
+)
 
 
 def _plugin(**kwargs) -> Plugin:
@@ -77,3 +82,64 @@ def test_enrich_stores_byte_sha(tmp_path: Path, monkeypatch):
     cache = load_categories_cache(cache_path)
     assert cache[plugin.download_url]["sha"] == content_sha(body)
     assert cache[plugin.download_url]["sha256"] == content_sha256(body)
+
+
+_OLD = "https://gitlab.com/old/p/-/raw/master/demo.py"
+_NEW = "https://gitlab.com/new/p/-/raw/master/demo.py"
+
+
+def _redirect_client() -> AsyncRedirectClient:
+    return AsyncRedirectClient(
+        {
+            _OLD: FakeStreamResponse(b"", _OLD, status=302, headers={"Location": _NEW}),
+            _NEW: FakeStreamResponse(
+                b"class demo:\n    supported_categories = {'all': '0', 'books': '1'}\n",
+                _NEW,
+            ),
+        }
+    )
+
+
+def test_enrich_reports_untrusted_redirect_without_caching(tmp_path: Path):
+    plugin = Plugin(
+        name="Demo",
+        site_url="https://example.com",
+        author="a",
+        author_url="",
+        version="1",
+        last_update="",
+        download_url=_OLD,
+        comments="",
+        visibility=Visibility.PUBLIC,
+        warning=False,
+    )
+    cache = tmp_path / "categories.json"
+    redirects: dict = {}
+    [first] = asyncio.run(
+        enrich_plugins_async(
+            [plugin],
+            cache_path=cache,
+            client=_redirect_client(),  # type: ignore[arg-type]
+            trusted_hosts={"gitlab:old/p"},
+            untrusted_redirects=redirects,
+        )
+    )
+    assert redirects[_OLD].trust_key == "gitlab:new/p"
+    assert redirects[_OLD].blocked_url == _NEW
+    assert first.categories != frozenset({"books"})
+    # Not cached, so a retry after approval fetches the real source.
+    assert _OLD not in load_categories_cache(cache)
+
+    redirects.clear()
+    [second] = asyncio.run(
+        enrich_plugins_async(
+            [plugin],
+            cache_path=cache,
+            client=_redirect_client(),  # type: ignore[arg-type]
+            trusted_hosts={"gitlab:old/p", "gitlab:new/p"},
+            untrusted_redirects=redirects,
+        )
+    )
+    assert redirects == {}
+    assert second.categories == frozenset({"books"})
+    assert _OLD in load_categories_cache(cache)

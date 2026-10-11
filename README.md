@@ -2,7 +2,7 @@
   <img src="branding/qbit-plugin-dl-icon.png" alt="qbit-plugin-dl icon" width="168" />
 </p>
 
-<h1 align="center">qBittorrent Plugin Downloader</h1>
+<h1 align="center">qbit - Torrent Plugin Manager</h1>
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/U5R225QZH3)
 
@@ -33,7 +33,7 @@ Fetches allowlisted catalogs (unofficial MediaWiki list, official `nova3/engines
 
 | Role | Value |
 |------|--------|
-| Display name | qBittorrent Plugin Downloader |
+| Display name | qbit - Torrent Plugin Manager |
 | CLI / desktop id | `qbit-plugin-dl` |
 | Python package | `qbit_plugin_dl` |
 | Branding asset | `branding/qbit-plugin-dl-icon.png` |
@@ -54,7 +54,7 @@ On first launch you must **Accept** the safety notice (persisted via Qt settings
 ## Threat model
 
 - Catalog entries come from allowlisted HTTPS sources only (MediaWiki list + GitHub Contents API for known repos). Download URLs use `raw.githubusercontent.com` or the wiki’s listed HTTPS links.
-- Downloads are **streamed** with a hard size abort (**10 MB**), redirect hop cap, and **HTTPS-only** URLs. Each redirect hop is checked before the request (host trust + private/link-local/metadata IP rejection). Auto-trust is **repo-scoped**: only `qbittorrent/search-plugins` and `LightDestory/qBittorrent-Search-Plugins` on `raw.githubusercontent.com`. Other repos and HTTPS hosts need a one-time or “Always trust” confirmation (asked before install, category resolve, and update checks). On code-hosting sites (GitHub incl. gists, Codeberg, GitLab) consent is per **project** (owner/repo), never for the whole site; other hosts are approved by hostname. If an install redirects to a project or host you have not approved (e.g. a renamed account), you are asked again and only those plugins are retried. DNS rebinding is not fully eliminated.
+- Downloads are **streamed** with a hard size abort (**10 MB**), redirect hop cap, and **HTTPS-only** URLs. Each redirect hop is checked before the request (host trust + private/link-local/metadata IP rejection). Auto-trust is **repo-scoped**: only `qbittorrent/search-plugins` and `LightDestory/qBittorrent-Search-Plugins` on `raw.githubusercontent.com`. Other repos and HTTPS hosts need a one-time or “Always trust” confirmation (asked before install, category resolve, and update checks). On code-hosting sites (GitHub incl. gists, Codeberg, GitLab) consent is per **project** (owner/repo), never for the whole site; other hosts are approved by hostname. If an install, category lookup or update check redirects to a project or host you have not approved (e.g. a renamed account), you are asked again and that step is retried (lookups and checks use the same read-only trust scope as their first prompt; declined sources are not asked about again this session). DNS rebinding is not fully eliminated.
 - Stale GitHub raw paths (common when wiki rows lag behind repo moves) are recovered via the GitHub git trees API (same repo/ref, matching basename, including `deprecated/` renames) before install/update checks give up.
 - This app validates basenames, runs the static safety check (and optional ClamAV — toggleable in the toolbar), and writes engines under the chosen `nova3/engines` directory with restrictive temp modes and atomic sidecar writes. It does **not** execute plugins.
 - The static check allows in-process threads (needed for Jackett and many engines) and blocks process spawning plus other high-risk APIs (`exec`, `subprocess`, `ctypes`, dynamic attribute indirection, …) and third-party HTTP clients (`requests` / `httpx` / `aiohttp`) that qBittorrent does not ship. It is not a runtime sandbox.
@@ -187,9 +187,15 @@ GUI smoke tests need an offscreen Qt platform (CI sets this). Plain `pytest` oft
 
 ## Releases
 
-GitHub Actions publishes a release from `main` whenever the `pyproject.toml` / `__init__.py` version has no `v<version>` tag yet (and AppStream lists the same version). A read-only job builds and tests the AppImage; a separate job with write access attests build provenance, attaches `SHA256SUMS.txt`, and writes release notes from commits since the previous tag (plus GitHub’s generated changelog).
+Releases are cut by pushing a `vX.Y.Z` tag. Before tagging, bump the version in `pyproject.toml`, `src/qbit_plugin_dl/__init__.py` and `uv.lock`, add a `<release>` entry to `appimage/qbit-plugin-dl.appdata.xml`, and merge to `main`. Then:
 
-**Actions → Release → Run workflow** retries the same check on `main`, e.g. after a failed publish.
+```bash
+git tag -a v0.2.0 -m "v0.2.0" && git push origin v0.2.0
+```
+
+The workflow refuses tags that don't match the project version or that point at a commit not on `main`. A read-only job builds and tests the AppImage; a separate job with write access attests build provenance, attaches `SHA256SUMS.txt`, and writes release notes since the previous tag (plus GitHub’s generated changelog).
+
+**Actions → Release → Run workflow** (with the tag name) rebuilds an existing tag, e.g. after a failed publish.
 
 ## Catalog sources
 

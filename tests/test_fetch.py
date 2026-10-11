@@ -31,7 +31,12 @@ from qbit_plugin_dl.fetch import (
 from qbit_plugin_dl.provenance import content_sha, content_sha256
 from qbit_plugin_dl.sources import default_providers
 from qbit_plugin_dl.updates import find_outdated_filenames
-from tests.http_fakes import AsyncRedirectClient, AsyncSingleClient, FakeStreamResponse
+from tests.http_fakes import (
+    AsyncRedirectClient,
+    AsyncSingleClient,
+    FakeStreamResponse,
+    SyncMapClient,
+)
 
 
 def test_allowlisted_hosts_are_known_cdns_not_auto_trust():
@@ -500,3 +505,61 @@ def test_blob_link_with_encoded_traversal_not_trusted():
     )
     assert not is_url_allowlisted(url)
     assert trust_key_for_url(url) is None
+
+
+def test_update_check_reports_untrusted_redirect(tmp_path: Path):
+    old = "https://gitlab.com/old/p/-/raw/master/demo.py"
+    new = "https://gitlab.com/new/p/-/raw/master/demo.py"
+    engines = tmp_path / "engines"
+    engines.mkdir()
+    body = b"installed\n"
+    (engines / "demo.py").write_bytes(body)
+    plugin = Plugin(
+        name="Demo",
+        site_url="",
+        author="",
+        author_url="",
+        version="",
+        last_update="",
+        download_url=old,
+        comments="",
+        visibility=Visibility.PUBLIC,
+        warning=False,
+    )
+    provenance = {"demo.py": {"download_url": old, "sha256": content_sha256(body)}}
+
+    def _client() -> SyncMapClient:
+        return SyncMapClient(
+            {
+                old: FakeStreamResponse(
+                    b"", old, status=302, headers={"Location": new}
+                ),
+                new: b"changed upstream\n",
+            }
+        )
+
+    redirects: dict = {}
+    outdated = find_outdated_filenames(
+        engines,
+        [plugin],
+        provenance=provenance,
+        categories_cache={},
+        client=_client(),  # type: ignore[arg-type]
+        trusted_hosts={"gitlab:old/p"},
+        untrusted_redirects=redirects,
+    )
+    assert outdated == set()
+    assert redirects[old].trust_key == "gitlab:new/p"
+
+    redirects.clear()
+    outdated = find_outdated_filenames(
+        engines,
+        [plugin],
+        provenance=provenance,
+        categories_cache={},
+        client=_client(),  # type: ignore[arg-type]
+        trusted_hosts={"gitlab:old/p", "gitlab:new/p"},
+        untrusted_redirects=redirects,
+    )
+    assert outdated == {"demo.py"}
+    assert redirects == {}

@@ -15,6 +15,12 @@ QT_QPA_PLATFORM=offscreen pytest -q
 qbit-plugin-dl --version
 ```
 
+## Release
+
+- Display name: **qbit - Torrent Plugin Manager**; CLI/package id stays `qbit-plugin-dl`.
+- Version lives in `pyproject.toml`, `__init__.__version__`, `uv.lock` and the AppStream `<releases>` list — bump all four.
+- Push a `vX.Y.Z` tag on a `main` commit to release (`.github/workflows/release.yml` verifies both).
+
 ## Trust / allowlist
 
 - Catalog providers: wiki + `qbittorrent/search-plugins` + `LightDestory/qBittorrent-Search-Plugins` (`sources.default_providers`).

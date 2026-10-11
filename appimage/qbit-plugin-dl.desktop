@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=qBittorrent Plugin Downloader
+Name=qbit - Torrent Plugin Manager
 GenericName=Search plugin installer
 Exec=qbit-plugin-dl
 Comment=Selective installer for unofficial qBittorrent search plugins

@@ -923,7 +923,7 @@ def test_stale_update_check_results_are_discarded(tmp_path: Path, monkeypatch):
     old_dir, new_dir = tmp_path / "old", tmp_path / "new"
     window._engines_dir = new_dir
     window._update_worker = SimpleNamespace(  # type: ignore[assignment]
-        engines_dir=old_dir, isRunning=lambda: True
+        engines_dir=old_dir, isRunning=lambda: True, untrusted_redirects={}
     )
     window._updates = set()
 
@@ -1154,3 +1154,82 @@ def test_install_redirect_prompt_retries_after_approval(
         assert "gitlab:new/p" not in window._session_trusted_hosts
         assert retries == []
         assert len(summaries) == 1
+
+
+@pytest.mark.parametrize("flow", ["categories", "updates"])
+@pytest.mark.parametrize("choice", ["Trust once", "Cancel"])
+def test_read_only_redirect_prompt(tmp_path: Path, monkeypatch, flow: str, choice: str):
+    """Category/update redirects get read-scoped consent and a re-run; declines stick."""
+    from types import SimpleNamespace
+
+    from PySide6.QtWidgets import QMessageBox
+
+    from qbit_plugin_dl.fetch import FetchError
+
+    app, window = _quiet_window(tmp_path, monkeypatch, f"qbit-plugin-dl-test-rr-{flow}")
+    del app
+    moved = _plugin(
+        name="Moved",
+        download_url="https://gitlab.com/old/p/-/raw/master/moved.py",
+    )
+    window._all_plugins = [moved]
+    redirect = FetchError(
+        message="Untrusted project",
+        code="host",
+        blocked_url="https://gitlab.com/new/p/-/raw/master/moved.py",
+        trust_key="gitlab:new/p",
+    )
+    fake_worker = SimpleNamespace(
+        untrusted_redirects={moved.download_url: redirect},
+        engines_dir=window._engines_dir,
+        isRunning=lambda: False,
+        wait=lambda *a: True,
+    )
+    prompts: list[QMessageBox] = []
+    chosen: dict[str, object] = {}
+
+    def fake_exec(self):  # noqa: ANN001
+        prompts.append(self)
+        chosen["btn"] = next(
+            (b for b in self.buttons() if b.text() == choice),
+            self.button(QMessageBox.StandardButton.Cancel),
+        )
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: chosen.get("btn"))
+    reruns: list[dict] = []
+    monkeypatch.setattr(window, "apply_filters", lambda: None)
+    if flow == "categories":
+        window._category_worker = fake_worker  # type: ignore[assignment]
+        monkeypatch.setattr(
+            window, "_start_category_enrichment", lambda *a, **kw: reruns.append(kw)
+        )
+        monkeypatch.setattr(window, "_start_update_check", lambda **kw: None)
+
+        def finish() -> None:
+            window._on_categories_loaded([moved])
+    else:
+        window._update_worker = fake_worker  # type: ignore[assignment]
+        window._update_recheck_pending = False
+        monkeypatch.setattr(
+            window, "_start_update_check", lambda **kw: reruns.append(kw)
+        )
+
+        def finish() -> None:
+            window._on_updates_checked(set())
+
+    finish()
+    assert len(prompts) == 1
+    assert prompts[0].defaultButton() is prompts[0].escapeButton()
+    assert "gitlab.com/new/p" in prompts[0].informativeText()
+    # Read-only approval never covers installs.
+    assert "gitlab:new/p" not in window._effective_trusted_hosts(install=True)
+    if choice == "Trust once":
+        assert "gitlab:new/p" in window._effective_trusted_hosts(install=False)
+        assert reruns == [{"redirect_round": 1}]
+    else:
+        assert reruns == []
+        assert "gitlab:new/p" in window._declined_download_hosts
+        finish()  # a declined source is not asked about again
+        assert len(prompts) == 1
