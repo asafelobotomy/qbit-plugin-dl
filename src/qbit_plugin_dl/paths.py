@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -58,6 +59,32 @@ def config_dir() -> Path:
     path = config_home() / APP_DIR_NAME
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def read_json_file(path: Path) -> object | None:
+    """
+    Parse a JSON sidecar, or None when missing/unreadable/corrupt.
+
+    Catches non-UTF-8 bytes (``UnicodeDecodeError``) and pathological nesting
+    (``RecursionError``) as well as plain syntax errors, so a damaged cache
+    never crashes startup or aborts an install batch.
+    """
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def read_json_object_of_dicts(path: Path) -> dict[str, dict]:
+    """Load a ``{str: {...}}`` sidecar, dropping malformed entries."""
+    data = read_json_file(path)
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: value
+        for key, value in data.items()
+        if isinstance(key, str) and isinstance(value, dict)
+    }
 
 
 def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:

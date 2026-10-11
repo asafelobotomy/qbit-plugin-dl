@@ -8,7 +8,11 @@ import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from qbit_plugin_dl.paths import atomic_write_text, cache_dir
+from qbit_plugin_dl.paths import (
+    atomic_write_text,
+    cache_dir,
+    read_json_object_of_dicts,
+)
 
 
 def installed_provenance_file() -> Path:
@@ -34,11 +38,7 @@ def load_installed_provenance(path: Path | None = None) -> dict[str, dict]:
     path = path or installed_provenance_file()
     if not path.is_file():
         return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return read_json_object_of_dicts(path)
 
 
 def save_installed_provenance(

@@ -433,12 +433,20 @@ def _write_engine(
                 pass
             raise
         os.replace(dest_tmp, dest)
-    except Exception:
+    except (OSError, ValueError) as exc:
+        # Disk full, read-only dir, name too long, containment change, …:
+        # fail this plugin only, never the whole batch.
         try:
             dest_tmp.unlink(missing_ok=True)
         except OSError:
             pass
-        raise
+        return InstallResult(
+            plugin=plugin,
+            ok=False,
+            path=None,
+            error=f"Could not write {provenance_name}: {exc}",
+            fix=fix,
+        )
 
     written_sha = content_sha(content)
     written_sha256 = content_sha256(content)
@@ -594,6 +602,8 @@ async def _install_plugin_with_optional_fix(
                     source_bytes=source_bytes_before_ast,
                     install_filename=install_filename,
                 )
+                if not result.ok:
+                    return replace(result, audit=report)
                 return InstallResult(
                     plugin=current,
                     ok=True,
@@ -650,6 +660,8 @@ async def _install_plugin_with_optional_fix(
             fix=None,
             install_filename=install_filename,
         )
+        if not result.ok:
+            return replace(result, audit=report)
         return InstallResult(
             plugin=current,
             ok=True,
@@ -698,17 +710,25 @@ async def install_plugins_async(
     completed = 0
 
     async def _run_one(index: int, plugin: Plugin) -> tuple[int, InstallResult]:
-        result = await _download_one(
-            client,
-            plugin,
-            engines_dir,
-            semaphore,
-            clamav_session,
-            auto_fix=auto_fix,
-            alternates_by_filename=filename_alternates,
-            trusted_hosts=trusted_hosts,
-            allow_ast_without_clamav=allow_ast_without_clamav,
-        )
+        try:
+            result = await _download_one(
+                client,
+                plugin,
+                engines_dir,
+                semaphore,
+                clamav_session,
+                auto_fix=auto_fix,
+                alternates_by_filename=filename_alternates,
+                trusted_hosts=trusted_hosts,
+                allow_ast_without_clamav=allow_ast_without_clamav,
+            )
+        except Exception as exc:  # noqa: BLE001 — isolate one plugin's failure
+            result = InstallResult(
+                plugin=plugin,
+                ok=False,
+                path=None,
+                error=f"Unexpected error: {type(exc).__name__}: {exc}",
+            )
         return index, result
 
     try:

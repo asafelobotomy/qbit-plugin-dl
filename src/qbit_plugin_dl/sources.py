@@ -23,7 +23,7 @@ from qbit_plugin_dl.catalog import (
     save_catalog_cache,
     sources_cache_dir,
 )
-from qbit_plugin_dl.paths import atomic_write_text
+from qbit_plugin_dl.paths import atomic_write_text, read_json_file
 
 GITHUB_API_ACCEPT = "application/vnd.github+json"
 GITHUB_API_VERSION = "2022-11-28"
@@ -177,10 +177,8 @@ class GitHubEnginesProvider:
         cache_path = self._cache_path()
         payload: list | dict | None = None
         if not force_refresh and _cache_is_fresh(cache_path, ttl):
-            try:
-                payload = json.loads(cache_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                payload = None
+            cached = read_json_file(cache_path)
+            payload = cached if isinstance(cached, (list, dict)) else None
 
         if payload is None:
             response = client.get(
