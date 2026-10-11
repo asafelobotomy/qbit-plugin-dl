@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import os
 import re
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -29,6 +30,7 @@ from qbit_plugin_dl.fix import (
     ranked_alternates,
     try_ast_fix_after_clamav,
 )
+from qbit_plugin_dl.paths import atomic_write_bytes, xdg_base_dir
 from qbit_plugin_dl.provenance import (
     content_sha,
     content_sha256,
@@ -40,7 +42,7 @@ from qbit_plugin_dl.provenance import (
 def candidate_engine_dirs(home: Path | None = None) -> list[Path]:
     """Return known Linux engines paths in preference order."""
     home = home or Path.home()
-    xdg_data = Path(os.environ.get("XDG_DATA_HOME", str(home / ".local" / "share")))
+    xdg_data = xdg_base_dir("XDG_DATA_HOME", home / ".local" / "share")
     return [
         home
         / ".var"
@@ -259,9 +261,11 @@ def companion_paths_for_engine(engines_dir: Path, filename: str) -> list[Path]:
 
     candidates: list[Path] = [
         dest,
-        Path(str(dest) + ".tmp"),
+        Path(str(dest) + ".tmp"),  # legacy fixed temp name
         engines_dir / f"{stem}.json",
     ]
+    # Leftovers from atomic_write_bytes (".<name>.<random>.tmp").
+    candidates.extend(engines_dir.glob(f".{glob.escape(safe_name)}.*.tmp"))
 
     for cache_dir in (engines_dir / "__pycache__", nova3_root / "__pycache__"):
         if not cache_dir.is_dir():
@@ -275,8 +279,11 @@ def companion_paths_for_engine(engines_dir: Path, filename: str) -> list[Path]:
             cache_resolved.relative_to(nova3_root)
         except ValueError:
             continue
-        for path in cache_dir.glob(f"{stem}*.pyc"):
-            candidates.append(path)
+        # Exactly this module's bytecode ("<stem>.cpython-312.pyc" or
+        # "<stem>.pyc"), never other modules sharing the prefix.
+        escaped = glob.escape(stem)
+        candidates.extend(cache_dir.glob(f"{escaped}.*.pyc"))
+        candidates.append(cache_dir / f"{stem}.pyc")
 
     # De-dupe while preserving order; only return existing files that stay
     # contained under nova3.
@@ -428,37 +435,15 @@ def _write_engine(
     source_bytes: bytes | None = None,
     install_filename: str | None = None,
 ) -> InstallResult:
-    dest_tmp = Path(str(dest) + ".tmp")
     provenance_error: str | None = None
     provenance_name = install_filename or plugin.filename
     try:
         # Re-validate containment immediately before replace (symlink TOCTOU).
         dest = resolve_plugin_dest(engines_dir, provenance_name)
-        dest_tmp = Path(str(dest) + ".tmp")
-        fd = os.open(
-            dest_tmp,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            0o600,
-        )
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except Exception:
-            try:
-                dest_tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-        os.replace(dest_tmp, dest)
+        atomic_write_bytes(dest, content)
     except (OSError, ValueError) as exc:
         # Disk full, read-only dir, name too long, containment change, …:
         # fail this plugin only, never the whole batch.
-        try:
-            dest_tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         return InstallResult(
             plugin=plugin,
             ok=False,
