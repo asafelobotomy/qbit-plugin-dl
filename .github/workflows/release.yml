@@ -10,24 +10,34 @@ on:
         type: boolean
         default: true
 
+# Least privilege by default. Only the small publish job, which runs no
+# third-party build code, gets a write-scoped token.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build AppImage and publish GitHub Release
+  build:
+    name: Build and test AppImage
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          # pip installs and tests run in this job; keep no token in .git/config.
+          persist-credentials: false
 
       - name: Detect version bump
         id: version
@@ -108,7 +118,6 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
 
       - name: Install system dependencies
         if: steps.version.outputs.should_release == 'true'
@@ -233,12 +242,8 @@ jobs:
             echo "Xvfb/xcb smoke OK (exit ${xrc})"
           fi
 
-      - name: Prepare release assets and notes
+      - name: Write checksums
         if: steps.version.outputs.should_release == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
-          TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -255,6 +260,55 @@ jobs:
             sha256sum "$asset" >> "$checksums"
           done
           cat "$checksums"
+
+      - name: Upload release assets
+        if: steps.version.outputs.should_release == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            qbit-plugin-dl*.AppImage
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: needs.build.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+
+      - name: Prepare release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          assets=(qbit-plugin-dl*.AppImage)
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "::error::No AppImage artifact found"
+            exit 1
+          fi
+          checksums="SHA256SUMS.txt"
+          sha256sum -c "$checksums"
 
           prev_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
 
@@ -305,11 +359,10 @@ jobs:
           cat RELEASE_NOTES.md
 
       - name: Create GitHub Release
-        if: steps.version.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
-          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ needs.build.outputs.tag }}
         run: |
           set -euo pipefail
           shopt -s nullglob
