@@ -92,13 +92,41 @@ def test_engine_dir_labels(tmp_path: Path, monkeypatch):
     )
 
 
-def test_validate_plugin_filename_ok():
-    assert validate_plugin_filename("engine.py") == "engine.py"
+@pytest.mark.parametrize(
+    "name", ["engine.py", "jackett.py", "x1337x.py", "Rutracker_v2.py", "e" * 64 + ".py"]
+)
+def test_validate_plugin_filename_ok(name: str):
+    assert validate_plugin_filename(name) == name
 
 
 @pytest.mark.parametrize(
     "name",
-    ["", "..", "../x.py", "a/b.py", "a\\b.py", "nope.txt", "."],
+    [
+        "",
+        "..",
+        "../x.py",
+        "a/b.py",
+        "a\\b.py",
+        "nope.txt",
+        ".",
+        "__init__.py",
+        "_private.py",
+        ".py",
+        ".hidden.py",
+        "*.py",
+        "[a-z]*.py",
+        "a b.py",
+        "a\nb.py",
+        "a\u202e.py",
+        "ｅｎｇｉｎｅ.py",
+        "-rf.py",
+        "1337x.py",
+        "e" * 65 + ".py",
+        "helpers.py",
+        "novaprinter.py",
+        "Nova2.py",
+        "socks.py",
+    ],
 )
 def test_validate_plugin_filename_rejects(name: str):
     with pytest.raises(ValueError):
@@ -339,13 +367,15 @@ def test_uninstall_rejects_path_trick(tmp_path: Path):
 
 
 def test_write_error_fails_only_that_plugin(tmp_path: Path, monkeypatch):
-    """ENAMETOOLONG (or disk full, read-only dir…) must not abort the batch."""
+    """A write error (disk full, read-only dir, …) must not abort the batch."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     engines = tmp_path / "engines"
     good = _plugin()
     other = _plugin(download_url="https://example.com/other.py")
-    too_long = _plugin(download_url=f"https://example.com/{'a' * 300}.py")
-    plugins = [too_long, good, other]
+    blocked = _plugin(download_url="https://example.com/blocked.py")
+    # os.replace onto an existing directory raises IsADirectoryError.
+    (engines / "blocked.py").mkdir(parents=True)
+    plugins = [blocked, good, other]
     client = AsyncMapClient({p.download_url: CLEAN_ENGINE_BYTES for p in plugins})
 
     results = asyncio.run(
@@ -358,8 +388,8 @@ def test_write_error_fails_only_that_plugin(tmp_path: Path, monkeypatch):
     )
 
     by_name = {r.plugin.filename: r for r in results}
-    assert not by_name[too_long.filename].ok
-    assert "Could not write" in (by_name[too_long.filename].error or "")
+    assert not by_name[blocked.filename].ok
+    assert "Could not write" in (by_name[blocked.filename].error or "")
     assert by_name["demo.py"].ok and by_name["other.py"].ok
     assert (engines / "demo.py").is_file() and (engines / "other.py").is_file()
     assert list(engines.glob("*.tmp")) == []

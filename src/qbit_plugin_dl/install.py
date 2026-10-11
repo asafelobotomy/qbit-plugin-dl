@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -118,12 +119,23 @@ def list_installed_filenames(engines_dir: Path) -> set[str]:
     return {path.name for path in engines_dir.glob("*.py")}
 
 
+# qBittorrent imports engines as ``engines.<stem>``, so a valid engine name is a
+# plain ASCII identifier. A leading letter also rules out ``__init__.py``.
+_ENGINE_FILENAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\.py")
+
+# nova3 / engines package modules an engine must never replace or shadow.
+_RESERVED_ENGINE_STEMS: frozenset[str] = frozenset(
+    {"helpers", "novaprinter", "nova2", "nova2dl", "socks", "sgmllib3", "template"}
+)
+
+
 def validate_plugin_filename(name: str) -> str:
     """
-    Require a safe .py basename with no path components.
+    Require a safe engine basename: ``<identifier>.py`` with no path components.
 
-    Raises ValueError when the name is empty, not a .py file, or contains
-    separators / parent references.
+    Raises ValueError for empty names, paths, non-``.py`` files, names that are
+    not plain ASCII identifiers (``__init__.py``, globs, spaces, control or
+    bidi characters, over-long names) and qBittorrent's own module names.
     """
     if not name or name in {".", ".."}:
         raise ValueError("Invalid plugin filename")
@@ -133,6 +145,13 @@ def validate_plugin_filename(name: str) -> str:
         raise ValueError(f"Plugin filename must not contain '..': {name!r}")
     if not name.endswith(".py"):
         raise ValueError(f"Plugin filename must end with .py: {name!r}")
+    if not _ENGINE_FILENAME_RE.fullmatch(name):
+        raise ValueError(
+            "Plugin filename must be a letter followed by up to 63 letters, "
+            f"digits or underscores, ending in .py: {name!r}"
+        )
+    if name[:-3].lower() in _RESERVED_ENGINE_STEMS:
+        raise ValueError(f"Plugin filename is reserved by qBittorrent: {name!r}")
     return name
 
 
