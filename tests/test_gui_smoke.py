@@ -789,3 +789,70 @@ def test_plugin_tree_item_sort_toggle_offscreen():
     tree.sortItems(COL_NAME, Qt.SortOrder.DescendingOrder)
     assert tree.topLevelItem(0).text(COL_NAME) == "Zed"
     assert app is not None
+
+
+def test_read_only_trust_once_does_not_cover_install(tmp_path: Path, monkeypatch):
+    """Trust once for a category/update fetch must not approve installs."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from qbit_plugin_dl.gui import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("qbit-plugin-dl-test-trust-scope")
+    app.setApplicationName("qbit-plugin-dl-test-trust-scope")
+    QSettings().remove("security/trusted_download_hosts")
+
+    window = MainWindow()
+    plugin = _plugin(download_url="https://codeberg.org/x/y/raw/branch/main/yts.py")
+    prompts: list[QMessageBox] = []
+    choice = {"text": "Trust once"}
+    chosen: dict[str, object] = {}
+
+    def fake_exec(self):  # noqa: ANN001
+        prompts.append(self)
+        chosen["btn"] = next(
+            (b for b in self.buttons() if b.text() == choice["text"]), None
+        )
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: chosen.get("btn"))
+
+    # Enter/Escape default to Cancel, never to a trust button.
+    assert window._prompt_untrusted_hosts(
+        [plugin], purpose="category resolve", required=False
+    )
+    box = prompts[-1]
+    assert box.defaultButton() is box.escapeButton()
+    assert box.standardButton(box.defaultButton()) == QMessageBox.StandardButton.Cancel
+
+    assert "codeberg.org" in window._effective_trusted_hosts(install=False)
+    assert "codeberg.org" not in window._effective_trusted_hosts(install=True)
+
+    # Read-only approval is reused for the next read-only fetch (no prompt) …
+    assert window._prompt_untrusted_hosts(
+        [plugin], purpose="update check", required=False
+    )
+    assert len(prompts) == 1
+    # … but installing still asks.
+    choice["text"] = "Cancel"
+    assert window._prompt_untrusted_hosts([plugin], purpose="install") is False
+    assert len(prompts) == 2
+
+    # A source declined for a read-only fetch can still be approved for install.
+    other = _plugin(download_url="https://scare.ca/dl/qBittorrent/x.py")
+    assert window._prompt_untrusted_hosts(
+        [other], purpose="category resolve", required=False
+    )
+    assert "scare.ca" in window._declined_download_hosts
+    choice["text"] = "Trust once"
+    assert window._prompt_untrusted_hosts([other], purpose="install") is True
+    assert len(prompts) == 4
+    assert "scare.ca" in window._effective_trusted_hosts(install=True)
+    assert "scare.ca" not in window._declined_download_hosts
+    window.close()
+    assert app is not None

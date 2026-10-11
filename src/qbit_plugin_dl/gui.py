@@ -1041,7 +1041,12 @@ class MainWindow(QMainWindow):
         self._installed: set[str] = set()
         self._fixed: set[str] = set()
         self._updates: set[str] = set()
+        # "Trust once" is scoped: approving a read-only fetch (category resolve,
+        # update check) must not silently approve installing from that source.
+        # Install approval also covers reads.
         self._session_trusted_hosts: set[str] = set()
+        self._session_read_trusted_hosts: set[str] = set()
+        # Only suppresses repeat prompts for optional (read-only) fetches.
         self._declined_download_hosts: set[str] = set()
         preferred = preferred_engines_dir()
         self._engines_dir = resolve_install_dir(preferred=preferred)
@@ -1367,8 +1372,11 @@ class MainWindow(QMainWindow):
         set_hide_discouraged_enabled(self.hide_discouraged.isChecked())
         self.apply_filters()
 
-    def _effective_trusted_hosts(self) -> set[str]:
-        return trusted_download_hosts() | self._session_trusted_hosts
+    def _effective_trusted_hosts(self, *, install: bool) -> set[str]:
+        hosts = trusted_download_hosts() | self._session_trusted_hosts
+        if not install:
+            hosts |= self._session_read_trusted_hosts
+        return hosts
 
     def _prompt_untrusted_hosts(
         self,
@@ -1387,9 +1395,10 @@ class MainWindow(QMainWindow):
         """
         unknown = untrusted_hosts_in_urls(
             (p.download_url for p in plugins),
-            trusted_hosts=self._effective_trusted_hosts(),
+            trusted_hosts=self._effective_trusted_hosts(install=required),
         )
-        unknown = [h for h in unknown if h not in self._declined_download_hosts]
+        if not required:
+            unknown = [h for h in unknown if h not in self._declined_download_hosts]
         if not unknown:
             return True
 
@@ -1421,17 +1430,26 @@ class MainWindow(QMainWindow):
         )
         once_btn = box.addButton("Trust once", QMessageBox.ButtonRole.AcceptRole)
         always_btn = box.addButton("Always trust", QMessageBox.ButtonRole.YesRole)
-        box.addButton(QMessageBox.StandardButton.Cancel)
+        cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+        # Enter / Escape must never approve an untrusted source.
+        box.setDefaultButton(cancel_btn)
+        box.setEscapeButton(cancel_btn)
         box.exec()
         clicked = box.clickedButton()
         if clicked is once_btn:
-            self._session_trusted_hosts.update(unknown)
+            if required:
+                self._session_trusted_hosts.update(unknown)
+            else:
+                self._session_read_trusted_hosts.update(unknown)
+            self._declined_download_hosts.difference_update(unknown)
             return True
         if clicked is always_btn:
             for key in unknown:
                 add_trusted_download_host(key)
+            self._declined_download_hosts.difference_update(unknown)
             return True
-        self._declined_download_hosts.update(unknown)
+        if not required:
+            self._declined_download_hosts.update(unknown)
         return not required
 
     def _plugin_key(self, plugin: Plugin) -> tuple[str, str]:
@@ -1547,7 +1565,7 @@ class MainWindow(QMainWindow):
         worker = CategoryWorker(
             self._all_plugins,
             force_refresh=force_refresh,
-            trusted_hosts=self._effective_trusted_hosts(),
+            trusted_hosts=self._effective_trusted_hosts(install=False),
         )
         self._category_worker = worker
         worker.progress.connect(self._on_category_progress)
@@ -1643,7 +1661,7 @@ class MainWindow(QMainWindow):
         worker = UpdateCheckWorker(
             self._engines_dir,
             list(self._all_plugins),
-            trusted_hosts=self._effective_trusted_hosts(),
+            trusted_hosts=self._effective_trusted_hosts(install=False),
         )
         self._update_worker = worker
         self._sync_update_all_button(busy=True)
@@ -1916,7 +1934,7 @@ class MainWindow(QMainWindow):
             clamav_session=session,
             auto_fix=self.auto_fix_cb.isChecked(),
             catalog=list(self._all_plugins),
-            trusted_hosts=self._effective_trusted_hosts(),
+            trusted_hosts=self._effective_trusted_hosts(install=True),
             allow_ast_without_clamav=self.ast_without_clam_cb.isChecked(),
         )
         self._install_worker = worker
