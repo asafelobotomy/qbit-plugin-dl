@@ -69,6 +69,7 @@ from qbit_plugin_dl.fetch import (
 )
 from qbit_plugin_dl.fix import FIX_INDICATOR, alternates_from_catalog
 from qbit_plugin_dl.install import (
+    MAX_PLUGIN_BYTES,
     InstallResult,
     UninstallResult,
     candidate_engine_dirs,
@@ -378,7 +379,7 @@ def format_install_summary(
     # Prefer ClamAV status from a result that actually ran a scan.
     collapsed_warn_plugins: dict[str, set[str]] = defaultdict(set)
     notable_warning_lines: list[str] = []
-    total_warn_findings = 0
+    warned_plugins: set[str] = set()
     clam_backend = "none"
     clam_status = "skipped"
     for result in results:
@@ -396,7 +397,7 @@ def format_install_summary(
         for finding in report.findings:
             if finding.severity != SEVERITY_WARN:
                 continue
-            total_warn_findings += 1
+            warned_plugins.add(result.plugin.name)
             if finding.code in _COLLAPSED_WARN_LABELS:
                 collapsed_warn_plugins[finding.code].add(result.plugin.name)
             else:
@@ -483,31 +484,30 @@ def format_install_summary(
             f"Blocked by safety check ({len(safety_blocked)}) — not installed"
         )
         http_client_roots = {"requests", "httpx", "aiohttp"}
-        blocked_roots: set[str] = set()
-        for result in safety_blocked:
-            report = result.audit
-            if report is not None:
-                blocked_roots.update(_import_roots_from_findings(report.fail_findings))
-        if blocked_roots & http_client_roots:
-            lines.append(
-                "Third-party HTTP libraries (requests/httpx/aiohttp) are not "
-                "available inside qBittorrent — engines must use urllib / helpers."
-            )
-        else:
-            lines.append(
-                "These engines use APIs that qBittorrent search plugins should not need."
-            )
         grouped: dict[str, list[str]] = defaultdict(list)
         labels: dict[str, str] = {}
         for result in safety_blocked:
             key, label = _safety_group_key(result)
             labels[key] = label
             grouped[key].append(result.plugin.name)
+        http_keys = {f"import:{root}" for root in http_client_roots}
+        if not http_keys & grouped.keys():
+            lines.append(
+                "These engines use APIs that qBittorrent search plugins should not need."
+            )
+        http_note_shown = False
         for key in sorted(grouped.keys()):
             names = grouped[key]
             lines.append("")
             lines.append(f"  {labels[key]} ({len(names)})")
             lines.append(f"    {_format_name_list(names)}")
+            # Explain under the group it applies to, not above every group.
+            if key in http_keys and not http_note_shown:
+                lines.append(
+                    "    Third-party HTTP libraries (requests/httpx/aiohttp) are not "
+                    "available inside qBittorrent — engines must use urllib / helpers."
+                )
+                http_note_shown = True
             hinted: set[str] = set()
             for result in safety_blocked:
                 if _safety_group_key(result)[0] != key:
@@ -529,10 +529,12 @@ def format_install_summary(
             if hint:
                 lines.append(f"    Alternate available: {hint}")
 
-    if total_warn_findings:
+    if warned_plugins:
+        count = len(warned_plugins)
         lines.append("")
         lines.append(
-            f"Notes on installed plugins ({total_warn_findings}) — installed anyway"
+            f"Notes on {count} installed plugin{'s' if count != 1 else ''} "
+            "— installed anyway"
         )
         if collapsed_warn_plugins:
             lines.append("  Common (informational):")
@@ -639,9 +641,14 @@ def format_uninstall_summary(
     return title, "\n".join(lines), icon
 
 
+def plugin_too_large(plugin: Plugin) -> bool:
+    """True when the catalog lists a size the download limit would reject."""
+    return plugin.size_bytes is not None and plugin.size_bytes > MAX_PLUGIN_BYTES
+
+
 def plugin_included_in_select_all(plugin: Plugin) -> bool:
-    """Whether Select all should check this plugin (skips discouraged)."""
-    return not plugin.warning
+    """Whether Select all should check this plugin (skips discouraged / too large)."""
+    return not plugin.warning and not plugin_too_large(plugin)
 
 
 def load_app_icon() -> QIcon:
@@ -1706,13 +1713,21 @@ class MainWindow(QMainWindow):
         return value if isinstance(value, Plugin) else None
 
     def _fill_plugin_item(self, item: QTreeWidgetItem, plugin: Plugin) -> None:
-        item.setFlags(
-            Qt.ItemFlag.ItemIsEnabled
-            | Qt.ItemFlag.ItemIsSelectable
-            | Qt.ItemFlag.ItemIsUserCheckable
-        )
+        too_large = plugin_too_large(plugin)
+        if too_large:
+            # Listed but can never pass the download size limit: show it greyed
+            # out and uncheckable instead of letting the install fail.
+            item.setFlags(Qt.ItemFlag.ItemIsUserCheckable)
+        else:
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
         item.setData(0, Qt.ItemDataRole.UserRole, plugin)
         key = self._plugin_key(plugin)
+        if too_large:
+            self._checked.discard(key)
         item.setCheckState(
             0,
             Qt.CheckState.Checked if key in self._checked else Qt.CheckState.Unchecked,
@@ -1735,12 +1750,23 @@ class MainWindow(QMainWindow):
             plugin.last_update,
             plugin.author,
             source_label,
-            plugin.comments,
+            (
+                f"Unavailable: file too large ({_format_byte_size(plugin.size_bytes or 0)} "
+                f"> {_format_byte_size(MAX_PLUGIN_BYTES)} limit). {plugin.comments}"
+                if too_large
+                else plugin.comments
+            ),
             "Yes" if plugin.filename in self._installed else "No",
         )
         for col, value in enumerate(values, start=1):
             item.setText(col, value)
-        if has_update:
+        if too_large:
+            item.setToolTip(
+                COL_NAME,
+                f"Too large to install ({_format_byte_size(plugin.size_bytes or 0)} > "
+                f"{_format_byte_size(MAX_PLUGIN_BYTES)} download limit)",
+            )
+        elif has_update:
             tip = "Update available — catalog source differs from what was installed"
             if is_fixed:
                 kinds = fix_kinds_for_filename(plugin.filename)
@@ -2143,6 +2169,8 @@ class MainWindow(QMainWindow):
     def _selected_plugins(self) -> list[Plugin]:
         selected: list[Plugin] = []
         for plugin in self._all_plugins:
+            if plugin_too_large(plugin):
+                continue
             if self._plugin_key(plugin) in self._checked:
                 selected.append(plugin)
         return selected

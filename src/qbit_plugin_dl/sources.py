@@ -131,6 +131,8 @@ def parse_github_contents_listing(
         download_url = (
             f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{raw_path}"
         )
+        size = entry.get("size")
+        size_bytes = size if isinstance(size, int) and not isinstance(size, bool) else None
         comments = f"Source: {source_label}"
         if name.lower() == "jackett.py":
             comments += " — requires a local Jackett instance"
@@ -147,6 +149,7 @@ def parse_github_contents_listing(
                 visibility=Visibility.PUBLIC,
                 warning=False,
                 source_id=source_id,
+                size_bytes=size_bytes,
             )
         )
     plugins.sort(key=lambda p: p.name.lower())

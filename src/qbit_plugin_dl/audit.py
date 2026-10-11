@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import io
 import math
+import re
 import tokenize
 import unicodedata
 import zipfile
@@ -244,6 +245,10 @@ _DYN_ATTR_FUNCS: frozenset[str] = frozenset(
 
 _HIGH_ENTROPY_MIN_LEN = 80
 _HIGH_ENTROPY_THRESHOLD = 4.5
+# Encoded payloads (base64 / hex / urlsafe base64) are long unbroken runs of
+# this alphabet. Scraping regexes and magnet/tracker URLs are just as
+# "random" by entropy but punctuation keeps their runs short.
+_BLOB_RUN = re.compile(r"[A-Za-z0-9+/=_-]{64,}")
 _EXTREME_LINE_LEN = 500
 
 
@@ -1062,7 +1067,10 @@ class _PolicyVisitor(ast.NodeVisitor):
     def visit_Constant(self, node: ast.Constant) -> None:
         value = node.value
         if isinstance(value, str) and len(value) >= _HIGH_ENTROPY_MIN_LEN:
-            if _shannon_entropy(value) >= _HIGH_ENTROPY_THRESHOLD:
+            if (
+                _shannon_entropy(value) >= _HIGH_ENTROPY_THRESHOLD
+                and _BLOB_RUN.search(value) is not None
+            ):
                 self.findings.append(
                     _finding(
                         "HIGH_ENTROPY",
@@ -1281,12 +1289,14 @@ def _check_nova3_structure(tree: ast.AST, stem: str) -> list[AuditFinding]:
                 )
             )
 
-    if search_fn is not None and not _calls_pretty_printer(search_fn):
+    # Results are usually printed from a parser class or helper, not search()
+    # itself, so only note engines that never call prettyPrinter anywhere.
+    if search_fn is not None and not _calls_pretty_printer(tree):
         findings.append(
             _finding(
                 "NOVA3_PRETTYPRINTER",
                 SEVERITY_WARN,
-                "search() does not call prettyPrinter (may still be valid)",
+                "prettyPrinter is never called (may still be valid)",
             )
         )
 
@@ -1325,11 +1335,20 @@ def _class_assigned_names(cls: ast.ClassDef) -> set[str]:
     return names
 
 
-def _calls_pretty_printer(fn: ast.AST) -> bool:
-    for node in ast.walk(fn):
+def _calls_pretty_printer(tree: ast.AST) -> bool:
+    # ``from novaprinter import prettyPrinter as pp`` → also accept ``pp(...)``.
+    names = {"prettyPrinter"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            names.update(
+                alias.asname
+                for alias in node.names
+                if alias.name == "prettyPrinter" and alias.asname
+            )
+    for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        if isinstance(node.func, ast.Name) and node.func.id == "prettyPrinter":
+        if isinstance(node.func, ast.Name) and node.func.id in names:
             return True
         chain = _attr_chain(node.func)
         if chain and chain[-1] == "prettyPrinter":

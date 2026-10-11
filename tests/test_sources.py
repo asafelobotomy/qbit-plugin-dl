@@ -169,3 +169,28 @@ def test_fetch_all_catalogs_all_fail():
     wiki = parse_mediawiki(WIKI_FIXTURE.read_text(encoding="utf-8"))
     assert wiki
     assert all(p.source_id == "wiki" for p in wiki)
+
+
+def test_parse_github_contents_records_size():
+    entries = [
+        {"type": "file", "name": "small.py", "size": 1234},
+        {"type": "file", "name": "huge.py", "size": 27037504},
+        {"type": "file", "name": "nosize.py"},
+        {"type": "file", "name": "bogus.py", "size": True},
+    ]
+    plugins = parse_github_contents_listing(
+        entries,
+        owner="LightDestory",
+        repo="qBittorrent-Search-Plugins",
+        path="src/engines",
+        ref="master",
+        source_id="lightdestory",
+        source_label="LightDestory",
+    )
+    sizes = {p.filename: p.size_bytes for p in plugins}
+    assert sizes == {
+        "small.py": 1234,
+        "huge.py": 27037504,
+        "nosize.py": None,
+        "bogus.py": None,
+    }

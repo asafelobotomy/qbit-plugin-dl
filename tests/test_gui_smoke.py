@@ -55,6 +55,40 @@ def _plugin(**kwargs) -> Plugin:
 def test_plugin_included_in_select_all():
     assert plugin_included_in_select_all(_plugin(warning=False))
     assert not plugin_included_in_select_all(_plugin(warning=True))
+    assert plugin_included_in_select_all(_plugin(size_bytes=1024))
+    assert not plugin_included_in_select_all(_plugin(size_bytes=27_037_504))
+
+
+def test_oversized_plugin_row_is_unavailable(tmp_path: Path, monkeypatch):
+    """A catalog entry over the download limit is greyed out and never installed."""
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-oversize")
+    huge = _plugin(
+        name="Tntvillagedump",
+        download_url="https://example.com/tntvillagedump.py",
+        size_bytes=27_037_504,
+    )
+    small = _plugin(name="Small", download_url="https://example.com/small.py")
+    window._all_plugins = [huge, small]
+    window._visible_plugins = [huge, small]
+    # Even a stale checked state (e.g. from before the size was known) is dropped.
+    window._checked.add(window._plugin_key(huge))
+    window._rebuild_tree()
+
+    rows = {}
+    root = window.tree.invisibleRootItem()
+    for i in range(root.childCount()):
+        item = root.child(i)
+        rows[item.data(0, Qt.ItemDataRole.UserRole).name] = item
+    huge_row = rows["Tntvillagedump"]
+    assert not huge_row.flags() & Qt.ItemFlag.ItemIsEnabled
+    assert huge_row.checkState(0) == Qt.CheckState.Unchecked
+    assert "25.8 MB" in huge_row.toolTip(COL_NAME)
+    assert rows["Small"].flags() & Qt.ItemFlag.ItemIsEnabled
+
+    window.select_all_visible()
+    assert window._selected_plugins() == [small]
+    window.close()
+    assert app is not None
 
 
 def test_cli_version(capsys):
@@ -245,14 +279,14 @@ def test_format_install_summary_groups_import_denies(tmp_path: Path):
     assert "Python 2 HTMLParser" in msg
     assert "Download / network errors" in msg
     assert "HTTP 404" in msg
-    assert "Notes on installed plugins" in msg
+    assert "Notes on 1 installed plugin " in msg
     assert "prettyPrinter heuristic notes" in msg
     assert "Common (informational)" in msg
     # Collapsed — plugin name not listed for NOVA3_PRETTYPRINTER alone.
-    assert "WarnOnly" not in msg.split("Notes on installed plugins")[-1].split(
+    assert "WarnOnly" not in msg.split("Notes on 1 installed plugin ")[-1].split(
         "Other notes"
     )[0]
-    assert "BlockedWarn" not in msg.split("Notes on installed plugins")[-1]
+    assert "BlockedWarn" not in msg.split("Notes on 1 installed plugin ")[-1]
 
 
 def test_format_uninstall_summary(tmp_path: Path):
@@ -739,7 +773,8 @@ def test_format_install_summary_collapses_common_warnings(tmp_path: Path):
         )
     )
     _, msg, _ = format_install_summary(results, tmp_path)
-    assert "Notes on installed plugins (7)" in msg
+    # Counts plugins with notes (4), not individual findings (7).
+    assert "Notes on 4 installed plugins" in msg
     assert "Python 2 compatibility shims: 3 plugins" in msg
     assert "prettyPrinter heuristic notes: 3 plugins" in msg
     assert "Other notes (1)" in msg
@@ -766,10 +801,35 @@ def test_format_install_summary_requests_messaging(tmp_path: Path):
             ),
         )
     ]
+    results.append(
+        InstallResult(
+            plugin=_plugin(name="FitGirl", download_url="https://example.com/fitgirl.py"),
+            ok=False,
+            path=None,
+            error="Safety check blocked install",
+            audit=AuditReport(
+                findings=(
+                    AuditFinding(
+                        code="IMPORT_DENY",
+                        severity="fail",
+                        message="Denied import 'socket' at line 18",
+                    ),
+                )
+            ),
+        )
+    )
     _, msg, _ = format_install_summary(results, tmp_path)
     assert "Uses requests" in msg
-    assert "not available inside qBittorrent" in msg
     assert "urllib" in msg
+    # The HTTP-library note sits under the requests group, not above all groups.
+    section = msg.split("Blocked by safety check (2)")[1]
+    header, *groups = section.split("\n\n  ")
+    note = "not available inside qBittorrent"
+    assert note not in header
+    [requests_group] = [g for g in groups if g.startswith("Uses requests")]
+    [socket_group] = [g for g in groups if "FitGirl" in g]
+    assert note in requests_group
+    assert note not in socket_group
 
 
 def test_format_install_summary_file_too_large(tmp_path: Path):

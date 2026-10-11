@@ -373,3 +373,49 @@ def test_common_engine_patterns_not_blocked(case: str):
     )
     report = audit_plugin_static(src.encode(), filename="demo.py")
     assert not report.blocked, report.fail_findings
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        # Typical scraping regex (from nyaa / torrentgalaxy style engines).
+        r'r"href=\"(/view/\d+)\"\s?.+?\"(.+?)\">.+?(magnet.+?)\".+?([0-9\,\.]+ (?:TiB|GiB|MiB|KiB|Bytes))</td>.+?<td[^>]*>(\d+)</td>"',
+        # Magnet link with percent-encoded tracker list.
+        '"magnet:?xt=urn:btih:{0}&dn={1}&tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969%2Fannounce&tr=udp%3A%2F%2F9.rarbg.to%3A2920%2Fannounce"',
+    ],
+)
+def test_high_entropy_ignores_regexes_and_magnet_urls(literal: str):
+    src = engine_source(body=f"pattern = {literal}\n        prettyPrinter({{}})")
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert not report.blocked  # parsed, so the absence below is meaningful
+    assert not any(f.code == "HIGH_ENTROPY" for f in report.warn_findings)
+
+
+def test_high_entropy_still_flags_encoded_blob():
+    blob = base64.b64encode(secrets.token_bytes(120)).decode()
+    src = engine_source(body=f"icon = {blob!r}\n        prettyPrinter({{}})")
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert any(f.code == "HIGH_ENTROPY" for f in report.warn_findings)
+
+
+def test_pretty_printer_called_from_helper_is_not_noted():
+    src = (
+        "from novaprinter import prettyPrinter as pp\n"
+        "class demo:\n"
+        '    url = "https://example.com"\n'
+        '    name = "Demo"\n'
+        '    supported_categories = {"all": ""}\n'
+        "    def search(self, what, cat='all'):\n"
+        "        self._emit(what)\n"
+        "    def _emit(self, what):\n"
+        "        pp({'name': what})\n"
+    )
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert not report.blocked
+    assert not any(f.code == "NOVA3_PRETTYPRINTER" for f in report.warn_findings)
+
+
+def test_pretty_printer_never_called_is_noted():
+    src = engine_source(body="print('|'.join([what]))")
+    report = audit_plugin_static(src.encode(), filename="demo.py")
+    assert any(f.code == "NOVA3_PRETTYPRINTER" for f in report.warn_findings)

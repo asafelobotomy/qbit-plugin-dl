@@ -70,6 +70,8 @@ class Plugin:
     warning: bool
     categories: frozenset[str] = frozenset()
     source_id: str = "wiki"
+    # Download size when the catalog lists it (GitHub Contents API); None = unknown.
+    size_bytes: int | None = None
 
     @property
     def filename(self) -> str:
