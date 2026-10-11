@@ -431,12 +431,71 @@ def test_main_window_clamav_checkbox_and_fix_tooltip(tmp_path: Path, monkeypatch
     assert app is not None
 
 
+_TRUST_CHOICES = {"Trust once": "once", "Always trust": "always", "Cancel": None}
+
+
+def _patch_trust_dialog(monkeypatch, choice: dict[str, str] | str) -> list:
+    """Replace the modal trust prompt; *choice* is a button label (or a dict
+    whose ``"text"`` can change between prompts). Returns shown dialogs."""
+    from qbit_plugin_dl.gui import TrustPromptDialog
+
+    prompts: list[TrustPromptDialog] = []
+
+    def fake_exec(self):  # noqa: ANN001
+        prompts.append(self)
+        text = choice["text"] if isinstance(choice, dict) else choice
+        self.choice = _TRUST_CHOICES[text]
+        return 0
+
+    monkeypatch.setattr(TrustPromptDialog, "exec", fake_exec)
+    return prompts
+
+
+def _assert_cancel_is_default(dialog) -> None:  # noqa: ANN001
+    """Enter / Escape must never approve an untrusted source."""
+    assert dialog.cancel_btn.isDefault()
+    for btn in (dialog.once_btn, dialog.always_btn):
+        assert not btn.isDefault() and not btn.autoDefault()
+    assert dialog.text_label.textFormat() == Qt.TextFormat.PlainText
+    assert dialog.question_label.textFormat() == Qt.TextFormat.PlainText
+
+
+def test_trust_prompt_stays_bounded_and_keys_cancel(tmp_path: Path, monkeypatch):
+    """Dozens of sources scroll inside a fixed-size dialog; Enter/Escape cancel."""
+    from PySide6.QtTest import QTest
+
+    from qbit_plugin_dl.gui import TrustPromptDialog
+
+    app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-trust-box")
+    entries = [
+        f"owner{i}/repo{i}\n  e.g. https://raw.githubusercontent.com/"
+        f"owner{i}/repo{i}/main/<b>engine{i}</b>.py"
+        for i in range(80)
+    ]
+    for key in (Qt.Key.Key_Return, Qt.Key.Key_Escape):
+        dialog = TrustPromptDialog(
+            "Untrusted download sources", "intro", "Approve?", entries, window
+        )
+        dialog.show()
+        app.processEvents()
+        assert dialog.height() <= 600 and dialog.width() <= 720
+        assert "(80 sources)" in dialog.question_label.text()
+        assert dialog.entries_view.verticalScrollBar().maximum() > 0
+        # Catalog text is shown literally, never as markup.
+        assert "<b>engine79</b>" in dialog.entries_view.toPlainText()
+        _assert_cancel_is_default(dialog)
+        QTest.keyClick(dialog, key)
+        assert dialog.result() == TrustPromptDialog.DialogCode.Rejected
+        assert dialog.choice is None
+    window.close()
+
+
 def test_prompt_untrusted_hosts_session_and_decline(tmp_path: Path, monkeypatch):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     from PySide6.QtCore import QSettings
-    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import QApplication
 
     from qbit_plugin_dl.gui import MainWindow
 
@@ -447,39 +506,15 @@ def test_prompt_untrusted_hosts_session_and_decline(tmp_path: Path, monkeypatch)
 
     window = MainWindow()
     plugin = _plugin(download_url="https://codeberg.org/x/y/raw/branch/main/yts.py")
-    chosen: dict[str, object] = {}
-
-    def fake_exec(self):  # noqa: ANN001
-        for btn in self.buttons():
-            if btn.text() == "Trust once":
-                chosen["btn"] = btn
-                return 0
-        chosen["btn"] = None
-        return 0
-
-    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
-    monkeypatch.setattr(
-        QMessageBox,
-        "clickedButton",
-        lambda self: chosen.get("btn"),
-    )
+    choice = {"text": "Trust once"}
+    prompts = _patch_trust_dialog(monkeypatch, choice)
     assert window._prompt_untrusted_hosts([plugin], purpose="install") is True
     assert "codeberg:x/y" in window._session_trusted_hosts
     assert "codeberg:x/y" not in trusted_download_hosts()
 
     # Declined hosts are not re-prompted (cancel path).
     other = _plugin(download_url="https://scare.ca/dl/qBittorrent/x.py")
-    chosen.clear()
-
-    def cancel_exec(self):  # noqa: ANN001
-        for btn in self.buttons():
-            if btn.text() == "Cancel":
-                chosen["btn"] = btn
-                return 0
-        chosen["btn"] = self.buttons()[-1]
-        return 0
-
-    monkeypatch.setattr(QMessageBox, "exec", cancel_exec)
+    choice["text"] = "Cancel"
     assert (
         window._prompt_untrusted_hosts(
             [other], purpose="category resolve", required=False
@@ -488,20 +523,14 @@ def test_prompt_untrusted_hosts_session_and_decline(tmp_path: Path, monkeypatch)
     )
     assert "scare.ca" in window._declined_download_hosts
     # Second call skips dialog because declined.
-    calls = {"n": 0}
-
-    def boom(self):  # noqa: ANN001
-        calls["n"] += 1
-        raise AssertionError("should not re-prompt declined host")
-
-    monkeypatch.setattr(QMessageBox, "exec", boom)
+    assert len(prompts) == 2
     assert (
         window._prompt_untrusted_hosts(
             [other], purpose="category resolve", required=False
         )
         is True
     )
-    assert calls["n"] == 0
+    assert len(prompts) == 2
     window.close()
     assert app is not None
 
@@ -797,7 +826,7 @@ def test_read_only_trust_once_does_not_cover_install(tmp_path: Path, monkeypatch
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     from PySide6.QtCore import QSettings
-    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import QApplication
 
     from qbit_plugin_dl.gui import MainWindow
 
@@ -808,27 +837,13 @@ def test_read_only_trust_once_does_not_cover_install(tmp_path: Path, monkeypatch
 
     window = MainWindow()
     plugin = _plugin(download_url="https://codeberg.org/x/y/raw/branch/main/yts.py")
-    prompts: list[QMessageBox] = []
     choice = {"text": "Trust once"}
-    chosen: dict[str, object] = {}
+    prompts = _patch_trust_dialog(monkeypatch, choice)
 
-    def fake_exec(self):  # noqa: ANN001
-        prompts.append(self)
-        chosen["btn"] = next(
-            (b for b in self.buttons() if b.text() == choice["text"]), None
-        )
-        return 0
-
-    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
-    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: chosen.get("btn"))
-
-    # Enter/Escape default to Cancel, never to a trust button.
     assert window._prompt_untrusted_hosts(
         [plugin], purpose="category resolve", required=False
     )
-    box = prompts[-1]
-    assert box.defaultButton() is box.escapeButton()
-    assert box.standardButton(box.defaultButton()) == QMessageBox.StandardButton.Cancel
+    _assert_cancel_is_default(prompts[-1])
 
     assert "codeberg:x/y" in window._effective_trusted_hosts(install=False)
     assert "codeberg:x/y" not in window._effective_trusted_hosts(install=True)
@@ -1081,7 +1096,7 @@ def test_install_redirect_prompt_retries_after_approval(
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     from PySide6.QtCore import QSettings
-    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import QApplication
 
     from qbit_plugin_dl.fetch import FetchError
     from qbit_plugin_dl.gui import InstallSummaryDialog, MainWindow
@@ -1109,20 +1124,7 @@ def test_install_redirect_prompt_retries_after_approval(
                       untrusted_redirect=redirect),
         InstallResult(plugin=fine, ok=True, path=tmp_path / "fine.py"),
     ]
-    prompts: list[QMessageBox] = []
-    chosen: dict[str, object] = {}
-
-    def fake_exec(self):  # noqa: ANN001
-        prompts.append(self)
-        chosen["btn"] = next(
-            (b for b in self.buttons() if b.text() == choice), None
-        )
-        if chosen["btn"] is None:
-            chosen["btn"] = self.button(QMessageBox.StandardButton.Cancel)
-        return 0
-
-    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
-    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: chosen.get("btn"))
+    prompts = _patch_trust_dialog(monkeypatch, choice)
     retries: list[tuple] = []
     sentinel = object()
 
@@ -1140,10 +1142,8 @@ def test_install_redirect_prompt_retries_after_approval(
     window._on_install_finished(results)
 
     assert len(prompts) == 1
-    box = prompts[0]
-    assert box.defaultButton() is box.escapeButton()
-    assert box.textFormat() == Qt.TextFormat.PlainText
-    assert "gitlab.com/new/p" in box.informativeText()
+    _assert_cancel_is_default(prompts[0])
+    assert "gitlab.com/new/p" in prompts[0].entries_view.toPlainText()
     if choice == "Trust once":
         assert "gitlab:new/p" in window._session_trusted_hosts
         assert retries and retries[0][0] == [moved]
@@ -1161,8 +1161,6 @@ def test_install_redirect_prompt_retries_after_approval(
 def test_read_only_redirect_prompt(tmp_path: Path, monkeypatch, flow: str, choice: str):
     """Category/update redirects get read-scoped consent and a re-run; declines stick."""
     from types import SimpleNamespace
-
-    from PySide6.QtWidgets import QMessageBox
 
     from qbit_plugin_dl.fetch import FetchError
 
@@ -1185,19 +1183,7 @@ def test_read_only_redirect_prompt(tmp_path: Path, monkeypatch, flow: str, choic
         isRunning=lambda: False,
         wait=lambda *a: True,
     )
-    prompts: list[QMessageBox] = []
-    chosen: dict[str, object] = {}
-
-    def fake_exec(self):  # noqa: ANN001
-        prompts.append(self)
-        chosen["btn"] = next(
-            (b for b in self.buttons() if b.text() == choice),
-            self.button(QMessageBox.StandardButton.Cancel),
-        )
-        return 0
-
-    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
-    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: chosen.get("btn"))
+    prompts = _patch_trust_dialog(monkeypatch, choice)
     reruns: list[dict] = []
     monkeypatch.setattr(window, "apply_filters", lambda: None)
     if flow == "categories":
@@ -1221,8 +1207,8 @@ def test_read_only_redirect_prompt(tmp_path: Path, monkeypatch, flow: str, choic
 
     finish()
     assert len(prompts) == 1
-    assert prompts[0].defaultButton() is prompts[0].escapeButton()
-    assert "gitlab.com/new/p" in prompts[0].informativeText()
+    _assert_cancel_is_default(prompts[0])
+    assert "gitlab.com/new/p" in prompts[0].entries_view.toPlainText()
     # Read-only approval never covers installs.
     assert "gitlab:new/p" not in window._effective_trusted_hosts(install=True)
     if choice == "Trust once":

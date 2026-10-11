@@ -1077,6 +1077,91 @@ class InstallSummaryDialog(QDialog):
         return style.standardIcon(sp)
 
 
+class TrustPromptDialog(QDialog):
+    """
+    Bounded Trust once / Always trust / Cancel prompt with a scrollable list.
+
+    A QMessageBox grows with its text, so a first-run category resolve listing
+    dozens of sources filled the screen. Everything is plain text: labels and
+    URLs come from the catalog.
+    """
+
+    ONCE = "once"
+    ALWAYS = "always"
+
+    def __init__(
+        self,
+        title: str,
+        text: str,
+        question: str,
+        entries: list[str],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.resize(600, 440)
+        self.setMinimumSize(440, 300)
+        self.setMaximumWidth(720)
+        self.choice: str | None = None
+
+        layout = QVBoxLayout(self)
+        header = QHBoxLayout()
+        icon_label = QLabel()
+        icon_label.setPixmap(
+            self.style()
+            .standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning)
+            .pixmap(32, 32)
+        )
+        header.addWidget(icon_label, alignment=Qt.AlignmentFlag.AlignTop)
+        self.text_label = QLabel(text)
+        self.text_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.text_label.setWordWrap(True)
+        header.addWidget(self.text_label, stretch=1)
+        layout.addLayout(header)
+
+        count = len(entries)
+        self.question_label = QLabel(
+            f"{question} ({count} source{'s' if count != 1 else ''})"
+        )
+        self.question_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.question_label.setWordWrap(True)
+        layout.addWidget(self.question_label)
+
+        self.entries_view = QTextEdit()
+        self.entries_view.setReadOnly(True)
+        self.entries_view.setPlainText("\n\n".join(entries))
+        self.entries_view.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.entries_view.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.entries_view.setMinimumHeight(140)
+        layout.addWidget(self.entries_view, stretch=1)
+
+        buttons = QDialogButtonBox()
+        self.always_btn = buttons.addButton(
+            "Always trust", QDialogButtonBox.ButtonRole.YesRole
+        )
+        self.once_btn = buttons.addButton(
+            "Trust once", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        self.cancel_btn = buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
+        # Enter / Escape must never approve an untrusted source.
+        for btn in (self.always_btn, self.once_btn):
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
+        self.cancel_btn.setDefault(True)
+        self.cancel_btn.setFocus()
+        self.once_btn.clicked.connect(lambda: self._finish(self.ONCE))
+        self.always_btn.clicked.connect(lambda: self._finish(self.ALWAYS))
+        self.cancel_btn.clicked.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _finish(self, choice: str) -> None:
+        self.choice = choice
+        self.accept()
+
+
 def show_plain_message(
     parent: QWidget | None,
     icon: QMessageBox.Icon,
@@ -1511,7 +1596,8 @@ class MainWindow(QMainWindow):
                 "LightDestory/qBittorrent-Search-Plugins on "
                 "raw.githubusercontent.com)."
             ),
-            details=f"Approve to continue this {purpose}:\n\n" + "\n\n".join(examples),
+            question=f"Approve to continue this {purpose}?",
+            entries=examples,
             required=required,
         )
         # Optional (read-only) fetches continue without the new sources.
@@ -1523,7 +1609,8 @@ class MainWindow(QMainWindow):
         *,
         title: str,
         text: str,
-        details: str,
+        question: str,
+        entries: list[str],
         required: bool = True,
     ) -> bool:
         """
@@ -1532,29 +1619,17 @@ class MainWindow(QMainWindow):
         Returns True only when the user approved. *required* picks install vs
         read-only scope for "Trust once"; read-only declines are remembered.
         """
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle(title)
-        # Labels and URLs come from the catalog: never let Qt render them as HTML.
-        box.setTextFormat(Qt.TextFormat.PlainText)
-        box.setText(text)
-        box.setInformativeText(details)
-        once_btn = box.addButton("Trust once", QMessageBox.ButtonRole.AcceptRole)
-        always_btn = box.addButton("Always trust", QMessageBox.ButtonRole.YesRole)
-        cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
-        # Enter / Escape must never approve an untrusted source.
-        box.setDefaultButton(cancel_btn)
-        box.setEscapeButton(cancel_btn)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is once_btn:
+        dialog = TrustPromptDialog(title, text, question, entries, parent=self)
+        dialog.exec()
+        choice = dialog.choice
+        if choice == TrustPromptDialog.ONCE:
             if required:
                 self._session_trusted_hosts.update(keys)
             else:
                 self._session_read_trusted_hosts.update(keys)
             self._declined_download_hosts.difference_update(keys)
             return True
-        if clicked is always_btn:
+        if choice == TrustPromptDialog.ALWAYS:
             for key in keys:
                 add_trusted_download_host(key)
             self._declined_download_hosts.difference_update(keys)
@@ -1606,10 +1681,8 @@ class MainWindow(QMainWindow):
                 "you approved. A redirect can mean the project moved, or that "
                 "the original location now points somewhere else."
             ),
-            details=(
-                f"Approve the new source and retry the {purpose}?\n\n"
-                + "\n\n".join(lines)
-            ),
+            question=f"Approve the new source and retry the {purpose}?",
+            entries=lines,
             required=required,
         ):
             return []
