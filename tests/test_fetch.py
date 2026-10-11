@@ -253,8 +253,8 @@ def test_content_length_early_reject():
 
     class BigCLClient:
         @asynccontextmanager
-        async def stream(self, method, u, follow_redirects=True):  # noqa: ANN001
-            del method, follow_redirects
+        async def stream(self, method, u, follow_redirects=True, **kwargs):  # noqa: ANN001
+            del method, follow_redirects, kwargs
             yield FakeStreamResponse(
                 b"tiny",
                 u,

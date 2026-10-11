@@ -161,7 +161,9 @@ def parse_supported_categories(source: str) -> frozenset[str]:
     literal = source[start:end]
     try:
         value = ast.literal_eval(literal)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
+        # Untrusted source: deep nesting can exhaust the evaluator on
+        # interpreters without the parser's nesting guard.
         return frozenset()
 
     if not isinstance(value, dict):

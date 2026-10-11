@@ -84,8 +84,9 @@ class AsyncMapClient:
         method: str,
         url: str,
         follow_redirects: bool = True,
+        **kwargs: object,
     ):
-        del method, follow_redirects
+        del method, follow_redirects, kwargs
         yield self._response(url)
 
     async def get(self, url: str) -> FakeStreamResponse:
@@ -121,8 +122,9 @@ class AsyncRedirectClient:
         method: str,
         url: str,
         follow_redirects: bool = True,
+        **kwargs: object,
     ):
-        del method, follow_redirects
+        del method, follow_redirects, kwargs
         yield self._response(url)
 
     async def aclose(self) -> None:
@@ -152,8 +154,9 @@ class AsyncSingleClient:
         method: str,
         url: str,
         follow_redirects: bool = True,
+        **kwargs: object,
     ):
-        del method, follow_redirects
+        del method, follow_redirects, kwargs
         self.gets.append(url)
         yield FakeStreamResponse(
             self._content,
@@ -194,8 +197,9 @@ class SyncMapClient:
         method: str,
         url: str,
         follow_redirects: bool = True,
+        **kwargs: object,
     ):
-        del method, follow_redirects
+        del method, follow_redirects, kwargs
         self.gets.append(url)
         yield FakeStreamResponse(
             self.mapping[url], url, chunk_size=self._chunk_size

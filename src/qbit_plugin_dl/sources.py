@@ -23,12 +23,17 @@ from qbit_plugin_dl.catalog import (
     save_catalog_cache,
     sources_cache_dir,
 )
+from qbit_plugin_dl.http_util import MetadataFetchError, get_capped
 from qbit_plugin_dl.paths import atomic_write_text, read_json_file
 
 GITHUB_API_ACCEPT = "application/vnd.github+json"
 GITHUB_API_VERSION = "2022-11-28"
 SKIP_ENGINE_FILES = frozenset({"__init__.py", "template.py"})
 
+
+
+_RAW_HOSTS = frozenset({"raw.githubusercontent.com"})
+_API_HOSTS = frozenset({"api.github.com"})
 
 class CatalogFetchError(RuntimeError):
     """Raised when every enabled catalog provider fails."""
@@ -73,9 +78,10 @@ class WikiCatalogProvider:
             if text is not None:
                 return parse_mediawiki(text)
 
-        response = client.get(url)
-        response.raise_for_status()
-        text = response.text
+        status, body = get_capped(client, url, allowed_hosts=_RAW_HOSTS)
+        if status != 200:
+            raise MetadataFetchError(f"HTTP {status} fetching catalog {url}")
+        text = body.decode("utf-8")
         save_catalog_cache(text, cache_path)
         return parse_mediawiki(text)
 
@@ -181,15 +187,18 @@ class GitHubEnginesProvider:
             payload = cached if isinstance(cached, (list, dict)) else None
 
         if payload is None:
-            response = client.get(
+            status, body = get_capped(
+                client,
                 self._api_url(),
+                allowed_hosts=_API_HOSTS,
                 headers={
                     "Accept": GITHUB_API_ACCEPT,
                     "X-GitHub-Api-Version": GITHUB_API_VERSION,
                 },
             )
-            response.raise_for_status()
-            payload = response.json()
+            if status != 200:
+                raise MetadataFetchError(f"HTTP {status} from {self._api_url()}")
+            payload = json.loads(body)
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(
                 cache_path,
@@ -248,7 +257,7 @@ def fetch_all_catalogs(
     providers = providers if providers is not None else default_providers()
     owns_client = client is None
     if client is None:
-        client = httpx.Client(timeout=30.0, follow_redirects=True)
+        client = httpx.Client(timeout=30.0)
 
     all_plugins: list[Plugin] = []
     parts: list[str] = []
