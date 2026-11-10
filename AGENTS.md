@@ -32,10 +32,10 @@ qbit-plugin-dl --version
 
 ## Safety audit
 
-- Never import/exec plugin code. Policy lives in `audit.py` (imports, calls, `getattr`/`__dict__`, nova3 structure).
+- Never import/exec plugin code. Policy lives in the `audit/` package: `policy.py` (allow/deny lists), `visitor*.py` (imports, calls, `getattr`/`__dict__`) and `structure.py` (nova3 structure).
 - ClamAV is optional and soft-fails unless infected.
 
 ## Layout tips
 
 - Shared download: `fetch.py` (+ `url_recover.py` for stale GitHub paths).
-- GUI is large (`gui.py`); prefer small focused modules when splitting.
+- GUI is the `gui/` package: `window.py` builds the main window and the `window_*` mixins hold its behaviour; workers, dialogs, settings and summaries have their own modules. Keep each under ~400 lines.
