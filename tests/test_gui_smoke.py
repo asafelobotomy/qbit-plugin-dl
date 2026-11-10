@@ -955,7 +955,7 @@ def test_close_with_running_worker_cancels_then_closes(tmp_path: Path, monkeypat
 
     from PySide6.QtCore import Signal
 
-    from qbit_plugin_dl.gui import _CancellableWorker
+    from qbit_plugin_dl.gui.workers import _CancellableWorker
 
     app, window = _quiet_window(tmp_path, monkeypatch, "qbit-plugin-dl-test-close")
 

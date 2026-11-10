@@ -1,20 +1,31 @@
-"""Detect qBittorrent engines directories and download selected plugins."""
+"""Download, audit, fix and write selected plugins into an engines directory.
+
+Engine-directory helpers live in ``engine_dirs`` and removal in ``uninstall``; both are
+re-exported here so existing imports keep working.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import glob
-import os
-import re
-from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
 
-from qbit_plugin_dl.audit import AuditReport, audit_plugin_bytes
+from qbit_plugin_dl.audit import audit_plugin_bytes
 from qbit_plugin_dl.audit_clamav import ClamAvSession
 from qbit_plugin_dl.catalog import Plugin
+from qbit_plugin_dl.engine_dirs import (
+    candidate_engine_dirs,
+    detect_engine_dirs,
+    engine_dir_kind,
+    format_engine_dir_label,
+    list_installed_filenames,
+    resolve_install_dir,
+    resolve_plugin_dest,
+    validate_plugin_filename,
+)
 from qbit_plugin_dl.fetch import (
     MAX_PLUGIN_BYTES,
     MAX_REDIRECTS,
@@ -31,358 +42,24 @@ from qbit_plugin_dl.fix import (
     ranked_alternates,
     try_ast_fix_after_clamav,
 )
-from qbit_plugin_dl.paths import atomic_write_bytes, xdg_base_dir
+from qbit_plugin_dl.install_results import (
+    InstallResult,
+    ProgressCallback,
+    _fix_report_for_failure,
+    _fix_report_for_write,
+)
+from qbit_plugin_dl.paths import atomic_write_bytes
 from qbit_plugin_dl.provenance import (
     content_sha,
     content_sha256,
     record_install_provenance,
-    remove_install_provenance,
 )
-
-
-def candidate_engine_dirs(home: Path | None = None) -> list[Path]:
-    """Return known Linux engines paths in preference order."""
-    home = home or Path.home()
-    xdg_data = xdg_base_dir("XDG_DATA_HOME", home / ".local" / "share")
-    return [
-        home
-        / ".var"
-        / "app"
-        / "org.qbittorrent.qBittorrent"
-        / "data"
-        / "qBittorrent"
-        / "nova3"
-        / "engines",
-        xdg_data / "qBittorrent" / "nova3" / "engines",
-        xdg_data / "data" / "qBittorrent" / "nova3" / "engines",
-    ]
-
-
-def detect_engine_dirs(home: Path | None = None) -> list[Path]:
-    """Return existing engines directories (may be empty)."""
-    return [path for path in candidate_engine_dirs(home) if path.is_dir()]
-
-
-def resolve_install_dir(home: Path | None = None, preferred: Path | None = None) -> Path:
-    """
-    Choose an install directory.
-
-    Prefer an explicit path, else the first existing candidate, else create the
-    modern native path.
-    """
-    if preferred is not None:
-        preferred.mkdir(parents=True, exist_ok=True)
-        return preferred
-
-    existing = detect_engine_dirs(home)
-    if existing:
-        return existing[0]
-
-    target = candidate_engine_dirs(home)[1]
-    target.mkdir(parents=True, exist_ok=True)
-    return target
-
-
-def engine_dir_kind(path: Path, home: Path | None = None) -> str:
-    """Classify an engines path as Flatpak, Native, Legacy, or Custom."""
-    candidates = candidate_engine_dirs(home)
-    resolved = path.expanduser()
-    try:
-        resolved = resolved.resolve()
-    except OSError:
-        pass
-    labels = ("Flatpak", "Native", "Legacy")
-    for label, candidate in zip(labels, candidates, strict=True):
-        try:
-            if resolved == candidate.resolve():
-                return label
-        except OSError:
-            if resolved == candidate:
-                return label
-    return "Custom"
-
-
-def format_engine_dir_label(
-    path: Path,
-    *,
-    will_create: bool = False,
-    home: Path | None = None,
-) -> str:
-    """Human-readable combo label for an engines directory."""
-    kind = engine_dir_kind(path, home=home)
-    label = f"{kind} — {path}"
-    if will_create:
-        label = f"{label} (will create)"
-    return label
-
-
-def list_installed_filenames(engines_dir: Path) -> set[str]:
-    if not engines_dir.is_dir():
-        return set()
-    return {path.name for path in engines_dir.glob("*.py")}
-
-
-# qBittorrent imports engines as ``engines.<stem>``, so a valid engine name is a
-# plain ASCII identifier. A leading letter also rules out ``__init__.py``.
-_ENGINE_FILENAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\.py")
-
-# nova3 / engines package modules an engine must never replace or shadow.
-_RESERVED_ENGINE_STEMS: frozenset[str] = frozenset(
-    {"helpers", "novaprinter", "nova2", "nova2dl", "socks", "sgmllib3", "template"}
+from qbit_plugin_dl.uninstall import (
+    UninstallResult,
+    companion_paths_for_engine,
+    uninstall_plugin,
+    uninstall_plugins,
 )
-
-
-def validate_plugin_filename(name: str) -> str:
-    """
-    Require a safe engine basename: ``<identifier>.py`` with no path components.
-
-    Raises ValueError for empty names, paths, non-``.py`` files, names that are
-    not plain ASCII identifiers (``__init__.py``, globs, spaces, control or
-    bidi characters, over-long names) and qBittorrent's own module names.
-    """
-    if not name or name in {".", ".."}:
-        raise ValueError("Invalid plugin filename")
-    if "/" in name or "\\" in name or name != Path(name).name:
-        raise ValueError(f"Plugin filename must be a basename: {name!r}")
-    if ".." in Path(name).parts:
-        raise ValueError(f"Plugin filename must not contain '..': {name!r}")
-    if not name.endswith(".py"):
-        raise ValueError(f"Plugin filename must end with .py: {name!r}")
-    if not _ENGINE_FILENAME_RE.fullmatch(name):
-        raise ValueError(
-            "Plugin filename must be a letter followed by up to 63 letters, "
-            f"digits or underscores, ending in .py: {name!r}"
-        )
-    if name[:-3].lower() in _RESERVED_ENGINE_STEMS:
-        raise ValueError(f"Plugin filename is reserved by qBittorrent: {name!r}")
-    return name
-
-
-def resolve_plugin_dest(engines_dir: Path, filename: str) -> Path:
-    """Return dest path under engines_dir after validating containment."""
-    safe_name = validate_plugin_filename(filename)
-    engines_root = engines_dir.resolve()
-    dest = (engines_dir / safe_name).resolve()
-    try:
-        dest.relative_to(engines_root)
-    except ValueError as exc:
-        raise ValueError(
-            f"Refusing to write outside engines dir: {dest}"
-        ) from exc
-    return dest
-
-
-@dataclass(frozen=True, slots=True)
-class InstallResult:
-    plugin: Plugin
-    ok: bool
-    path: Path | None
-    error: str | None = None
-    audit: AuditReport | None = None
-    fix: FixReport | None = None
-    provenance_error: str | None = None
-    # Set when the download redirected to a source the user has not approved.
-    # Callers may ask for consent and re-run the install.
-    untrusted_redirect: FetchError | None = None
-
-
-_AST_FIX_KINDS = frozenset(
-    {
-        FixKind.PY2_IMPORTS,
-        FixKind.PROCESS_POOL,
-        FixKind.MP_DUMMY,
-    }
-)
-
-
-def _fix_report_for_write(
-    *,
-    alternate_used: bool,
-    ast_kinds: Sequence[FixKind],
-    tried_urls: Sequence[str],
-    final_url: str,
-) -> FixReport | None:
-    kinds: list[FixKind] = []
-    if alternate_used:
-        kinds.append(FixKind.ALTERNATE)
-    kinds.extend(ast_kinds)
-    # Preserve order, drop duplicates.
-    kinds = list(dict.fromkeys(kinds))
-    if not kinds:
-        return None
-    return FixReport(
-        kinds=tuple(kinds),
-        rewritten=any(k in _AST_FIX_KINDS for k in ast_kinds),
-        alternate_used=alternate_used,
-        tried_urls=tuple(tried_urls),
-        final_url=final_url,
-    )
-
-
-def _fix_report_for_failure(
-    *,
-    alternate_used: bool,
-    ast_kinds: Sequence[FixKind],
-    tried_urls: Sequence[str],
-    final_url: str,
-) -> FixReport | None:
-    """Report attempted kinds for a failed install (includes this-round AST)."""
-    return _fix_report_for_write(
-        alternate_used=alternate_used,
-        ast_kinds=ast_kinds,
-        tried_urls=tried_urls,
-        final_url=final_url,
-    )
-
-@dataclass(frozen=True, slots=True)
-class UninstallResult:
-    """Outcome of removing one engine basename and its companions."""
-
-    filename: str
-    ok: bool
-    removed: tuple[Path, ...] = ()
-    error: str | None = None
-    plugin: Plugin | None = None
-
-
-ProgressCallback = Callable[[int, int, Plugin, InstallResult | None], None]
-UninstallProgressCallback = Callable[[int, int, str, UninstallResult | None], None]
-
-
-def companion_paths_for_engine(engines_dir: Path, filename: str) -> list[Path]:
-    """
-    Return paths that belong to an engine install and should be removed with it.
-
-    Includes the ``.py``, leftover ``.tmp``, stem-named JSON config (e.g.
-    ``jackett.json``), and matching ``__pycache__`` bytecode under engines and
-    the parent ``nova3`` directory.
-    """
-    safe_name = validate_plugin_filename(filename)
-    dest = resolve_plugin_dest(engines_dir, safe_name)
-    stem = Path(safe_name).stem
-    engines_root = engines_dir.resolve()
-    nova3_root = engines_root.parent
-
-    candidates: list[Path] = [
-        dest,
-        Path(str(dest) + ".tmp"),  # legacy fixed temp name
-        engines_dir / f"{stem}.json",
-    ]
-    # Leftovers from atomic_write_bytes (".<name>.<random>.tmp").
-    candidates.extend(engines_dir.glob(f".{glob.escape(safe_name)}.*.tmp"))
-
-    for cache_dir in (engines_dir / "__pycache__", nova3_root / "__pycache__"):
-        if not cache_dir.is_dir():
-            continue
-        try:
-            cache_resolved = cache_dir.resolve()
-        except OSError:
-            continue
-        # Keep deletions under engines or nova3 only.
-        try:
-            cache_resolved.relative_to(nova3_root)
-        except ValueError:
-            continue
-        # Exactly this module's bytecode ("<stem>.cpython-312.pyc" or
-        # "<stem>.pyc"), never other modules sharing the prefix.
-        escaped = glob.escape(stem)
-        candidates.extend(cache_dir.glob(f"{escaped}.*.pyc"))
-        candidates.append(cache_dir / f"{stem}.pyc")
-
-    # De-dupe while preserving order; only return existing files that stay
-    # contained under nova3.
-    seen: set[Path] = set()
-    contained: list[Path] = []
-    for path in candidates:
-        try:
-            resolved = path.resolve()
-            resolved.relative_to(nova3_root)
-        except (OSError, ValueError):
-            continue
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        if path.is_file():
-            contained.append(path)
-    return contained
-
-
-def uninstall_plugin(
-    filename: str,
-    engines_dir: Path,
-    *,
-    plugin: Plugin | None = None,
-) -> UninstallResult:
-    """
-    Fully remove one installed engine: script, companions, provenance.
-
-    Idempotent: missing files are treated as success (already clean).
-    """
-    try:
-        safe_name = validate_plugin_filename(filename)
-        resolve_plugin_dest(engines_dir, safe_name)
-    except ValueError as exc:
-        return UninstallResult(
-            filename=filename,
-            ok=False,
-            error=str(exc),
-            plugin=plugin,
-        )
-
-    removed: list[Path] = []
-    errors: list[str] = []
-    for path in companion_paths_for_engine(engines_dir, safe_name):
-        try:
-            path.unlink()
-            removed.append(path)
-        except OSError as exc:
-            errors.append(f"{path.name}: {exc}")
-
-    try:
-        remove_install_provenance(safe_name)
-    except OSError as exc:
-        errors.append(f"provenance: {exc}")
-
-    if errors:
-        return UninstallResult(
-            filename=safe_name,
-            ok=False,
-            removed=tuple(removed),
-            error="; ".join(errors),
-            plugin=plugin,
-        )
-    return UninstallResult(
-        filename=safe_name,
-        ok=True,
-        removed=tuple(removed),
-        plugin=plugin,
-    )
-
-
-def uninstall_plugins(
-    plugins: Sequence[Plugin],
-    engines_dir: Path,
-    *,
-    on_progress: UninstallProgressCallback | None = None,
-) -> list[UninstallResult]:
-    """
-    Uninstall selected plugins by unique basename (full clean).
-
-    Multiple catalog rows that share a filename are processed once.
-    """
-    # Preserve first-seen order while deduping by filename.
-    by_filename: dict[str, Plugin] = {}
-    for plugin in plugins:
-        by_filename.setdefault(plugin.filename, plugin)
-
-    total = len(by_filename)
-    results: list[UninstallResult] = []
-    for index, (filename, plugin) in enumerate(by_filename.items(), start=1):
-        result = uninstall_plugin(filename, engines_dir, plugin=plugin)
-        results.append(result)
-        if on_progress is not None:
-            on_progress(index, total, filename, result)
-    return results
 
 
 async def _download_one(
@@ -786,3 +463,24 @@ def install_plugins(
             allow_ast_without_clamav=allow_ast_without_clamav,
         )
     )
+
+
+__all__ = [
+    "MAX_PLUGIN_BYTES",
+    "InstallResult",
+    "UninstallResult",
+    "candidate_engine_dirs",
+    "companion_paths_for_engine",
+    "detect_engine_dirs",
+    "engine_dir_kind",
+    "format_engine_dir_label",
+    "install_plugins",
+    "install_plugins_async",
+    "list_installed_filenames",
+    "require_https_url",
+    "resolve_install_dir",
+    "resolve_plugin_dest",
+    "uninstall_plugin",
+    "uninstall_plugins",
+    "validate_plugin_filename",
+]
